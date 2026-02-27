@@ -24,7 +24,3 @@ Workplace safety remains a critical challenge across industries. Manual safety c
 | **Ultrasonic Sensors** | Obstacle detection and avoidance |
 | **Standard Robot Car Kit** | Chassis and structural platform |
 
-**Total estimated cost: < $50**
-
----
-
