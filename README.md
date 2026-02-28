@@ -1,11 +1,11 @@
-## 📌 Problem
+## Problem
 
 Workplace safety remains a critical challenge across industries. Manual safety checks are sporadic and prone to human error — supervisors simply cannot be everywhere at once. Failure to wear PPE (Personal Protective Equipment) leads to severe injuries and massive regulatory fines.
 
 
 ---
 
-## 🔧 How It Works
+## How It Works
 
 1. **Autonomous Patrol** — The robot navigates facility floors independently using predefined paths.
 2. **Computer Vision** — An on-board camera scans for human faces in the environment.
@@ -14,7 +14,7 @@ Workplace safety remains a critical challenge across industries. Manual safety c
 
 ---
 
-## 🏗️ Hardware Architecture
+## Hardware Architecture
 
 | Component | Purpose |
 |---|---|
