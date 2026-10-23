@@ -77,11 +77,15 @@ def preflight(cfg, args) -> list[str]:
     try:
         import numpy
 
-        if not args.simulate and numpy.__version__.startswith("2."):
+        # picamera2/simplejpeg/cv2 from apt are built against the distro's
+        # numpy (1.x on Bookworm, 2.x on Trixie). The hazard is not a version
+        # number but a pip-installed numpy in the venv shadowing that one.
+        if not args.simulate and not numpy.__file__.startswith("/usr/"):
             print(
-                f"[preflight] NOTE: numpy {numpy.__version__} is installed. "
-                "Bookworm's picamera2 stack is built against numpy 1.x; if "
-                "camera capture fails with ABI errors, that is why."
+                f"[preflight] NOTE: numpy {numpy.__version__} is loaded from "
+                f"{Path(numpy.__file__).parent}, not the system packages. The "
+                "apt camera stack is built against the system numpy; if "
+                "capture fails with ABI errors, `pip uninstall numpy` in the venv."
             )
     except ImportError:
         problems.append("numpy is not installed")
@@ -158,7 +162,11 @@ def main() -> int:
         print(f"  {pending} snapshot(s) already queued from a previous run\n")
 
     camera = open_camera(cfg, args.source, args.index, args.path)
-    car = open_car(simulate=args.simulate, no_motors=args.no_motors)
+    car = open_car(
+        simulate=args.simulate,
+        no_motors=args.no_motors,
+        reverse_motors=cfg.patrol.reverse_motors,
+    )
 
     frame_buffer = None
     mjpeg = None

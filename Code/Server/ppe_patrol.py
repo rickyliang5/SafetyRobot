@@ -156,6 +156,8 @@ class RealCar:
     tuned duty values are reused in the state machine below.
     """
 
+    reverse_motors = False
+
     def __init__(self) -> None:
         from car import Car
 
@@ -176,6 +178,8 @@ class RealCar:
             print(f"[patrol] buzzer unavailable: {exc}")
 
     def set_motor_model(self, d1: int, d2: int, d3: int, d4: int) -> None:
+        if self.reverse_motors:
+            d1, d2, d3, d4 = -d1, -d2, -d3, -d4
         self.car.motor.set_motor_model(d1, d2, d3, d4)
 
     def set_servo_pwm(self, channel: str, angle: int) -> None:
@@ -286,15 +290,20 @@ class NoMotorCar:
         self.inner.close()
 
 
-def open_car(simulate: bool = False, no_motors: bool = False) -> CarInterface:
+def open_car(
+    simulate: bool = False, no_motors: bool = False, reverse_motors: bool = False
+) -> CarInterface:
     if simulate:
         print("[patrol] using a simulated car (no hardware)")
         return SimulatedCar()
     try:
-        car: CarInterface = RealCar()
+        car = RealCar()
     except Exception as exc:
         print(f"[patrol] hardware unavailable ({exc}); falling back to simulation")
         return SimulatedCar()
+    car.reverse_motors = reverse_motors
+    if reverse_motors:
+        print("[patrol] reverse_motors: all motor commands negated")
     if no_motors:
         print("[patrol] --no-motors: wheels disabled, sensors live")
         return NoMotorCar(car)

@@ -133,8 +133,11 @@ def verify(onnx_path: Path, weights: Path, image: Path, conf: float, iou: float)
 
     model = YOLO(str(weights))
     imgsz = PpeDetector(onnx_path).input_size[0]
+    # rect=False: a .pt model otherwise letterboxes to the minimal stride
+    # multiple (e.g. 480x640 for a portrait photo) while the ONNX graph is a
+    # fixed square, so the two would be judged on different inputs.
     res = model.predict(
-        source=str(image), imgsz=imgsz, conf=conf, iou=iou, verbose=False
+        source=str(image), imgsz=imgsz, conf=conf, iou=iou, rect=False, verbose=False
     )[0]
     ref = []
     for b in res.boxes:

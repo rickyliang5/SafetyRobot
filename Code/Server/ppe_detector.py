@@ -68,8 +68,10 @@ def letterbox(
     unpad_w, unpad_h = round(w * ratio), round(h * ratio)
 
     if (w, h) != (unpad_w, unpad_h):
-        interp = cv2.INTER_LINEAR if ratio > 1 else cv2.INTER_AREA
-        img = cv2.resize(img, (unpad_w, unpad_h), interpolation=interp)
+        # Always INTER_LINEAR, as ultralytics' LetterBox does. INTER_AREA
+        # looks like the "better" downscaler but feeds the model pixels it
+        # never saw in training, shifting confidences by up to ~0.1.
+        img = cv2.resize(img, (unpad_w, unpad_h), interpolation=cv2.INTER_LINEAR)
 
     pad_x = (new_w - unpad_w) / 2.0
     pad_y = (new_h - unpad_h) / 2.0
@@ -458,15 +460,21 @@ def annotate(
     if observations:
         for obs in observations:
             missing = obs.missing_items()
-            colour = (60, 60, 240) if missing else (90, 210, 120)
+            # UNKNOWN must not draw as "PPE OK": the live view is how people
+            # judge the detector, and green on an unjudged person misleads.
+            unknown = any(ev.status == "UNKNOWN" for ev in obs.items.values())
+            if missing:
+                colour = (60, 60, 240)
+                label = "NO " + ", ".join(m.upper() for m in missing)
+            elif unknown:
+                colour = (150, 150, 150)
+                label = "CAN'T TELL"
+            else:
+                colour = (90, 210, 120)
+                label = "PPE OK"
             p1 = (int(obs.person.x1), int(obs.person.y1))
             p2 = (int(obs.person.x2), int(obs.person.y2))
             cv2.rectangle(out, p1, p2, colour, 2)
-            label = (
-                "NO " + ", ".join(m.upper() for m in missing)
-                if missing
-                else "PPE OK"
-            )
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             ty = max(th + 4, p1[1])
             cv2.rectangle(out, (p1[0], ty - th - 4), (p1[0] + tw + 6, ty + 2), colour, -1)

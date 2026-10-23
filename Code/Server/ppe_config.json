@@ -31,7 +31,8 @@
   },
 
   "patrol": {
-    "cruise_duty": 700,
+    "cruise_duty": 1200,
+    "reverse_motors": true,
     "stop_distance_cm": 35.0,
     "pan_center": 90,
     "pan_left": 60,
@@ -41,6 +42,8 @@
 
   "camera": {
     "stream_size": [640, 480],
+    "hflip": true,
+    "vflip": true,
     "mjpeg_port": 8080
   },
 

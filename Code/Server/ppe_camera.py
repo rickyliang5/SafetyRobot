@@ -9,7 +9,7 @@ for a *new* frame -- so it blocks forever if streaming was never started
 Instead the patrol configures picamera2 itself with no encoder at all and
 pulls BGR arrays straight from the ISP:
 
-  * 640x480 `main` stream in XBGR8888, one `capture_array` per inference.
+  * 640x480 `main` stream in XRGB8888, one `capture_array` per inference.
   * 640x480 letterboxes into the model's 640x640 with padding ONLY and zero
     downscaling. The model was trained at imgsz=640, so this is the cheapest
     accuracy in the whole project. Upstream's 400x300 stream (main.py:46)
@@ -71,11 +71,14 @@ class PiCamera:
         from picamera2 import Picamera2
 
         self.camera = Picamera2()
-        # XBGR8888 gives a 4-channel array we drop the alpha from -- one
-        # cvtColor, no colour-space guessing. A `lores` stream would be forced
-        # to YUV420 and need a heavier conversion for no benefit here.
+        # libcamera names formats by 32-bit word, so in memory XRGB8888 is
+        # B,G,R,X -- OpenCV's BGRA -- and XBGR8888 is R,G,B,X. Using XBGR here
+        # swaps red and blue: skin turns blue and the model sees frames unlike
+        # anything it trained on. Drop the alpha with one cvtColor. A `lores`
+        # stream would be forced to YUV420 and need a heavier conversion for
+        # no benefit here.
         config = self.camera.create_video_configuration(
-            main={"size": self._size, "format": "XBGR8888"},
+            main={"size": self._size, "format": "XRGB8888"},
             transform=Transform(
                 hflip=1 if self.hflip else 0, vflip=1 if self.vflip else 0
             ),

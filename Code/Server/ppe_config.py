@@ -217,6 +217,11 @@ class PatrolConfig:
     cruise_duty: int = 700
     pivot_duty: int = 1200
     reverse_duty: int = -1300
+    # Negate every motor command. Set when positive duty drives the robot
+    # AWAY from the camera/ultrasonic side (motor leads reversed). Negating
+    # all four also reverses pivots, which keeps "turn toward the open side"
+    # correct in that case.
+    reverse_motors: bool = False
     stop_distance_cm: float = 35.0
     stuck_distance_cm: float = 20.0
     pan_center: int = 90

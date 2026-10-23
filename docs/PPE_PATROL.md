@@ -185,22 +185,42 @@ python3 -m venv --system-site-packages ~/ppe-venv
 > ### ⚠ The numpy ABI trap
 >
 > `--system-site-packages` is **mandatory** — without it picamera2, gpiozero and PyQt5 vanish,
-> since Bookworm ships them as system packages.
+> since Raspberry Pi OS ships them as system packages.
 >
-> More subtly: Bookworm's picamera2 stack is compiled against **numpy 1.x**. If pip ever pulls
-> `numpy>=2` or `opencv-python` into this venv, camera capture breaks with ABI errors that look
-> exactly like a camera hardware fault, and you will spend an evening on it. `pip list --local`
-> is the canary — it should show onnxruntime and its own small dependencies, and **neither numpy
-> nor opencv-python**. If it does, `pip uninstall numpy opencv-python` and reinstall onnxruntime
-> with `--no-deps`.
+> The apt camera stack (picamera2, simplejpeg, python3-opencv) is compiled against the
+> **distro's numpy**: 1.x on Bookworm, 2.x on Trixie. The version number isn't the danger. The
+> danger is pip putting a *second* numpy (or `opencv-python`) into the venv that shadows the
+> system one. Camera capture then breaks with ABI errors that look exactly like a camera
+> hardware fault. `pip list --local` is the canary: it should show onnxruntime and its own
+> small dependencies, and **neither numpy nor opencv-python**. If it does,
+> `pip uninstall numpy opencv-python` and reinstall onnxruntime with `--no-deps`.
 >
-> This is exactly why the Pi doesn't get ultralytics: it depends on `opencv-python` and
-> `numpy>=2`, so installing it would break the camera.
+> This is exactly why the Pi doesn't get ultralytics in its runtime venv.
+
+> ### Exporting on the Pi instead of a PC
+>
+> Works fine on a Pi 5 (Trixie, Python 3.13), in a **throwaway venv without**
+> `--system-site-packages` so torch's numpy can never leak into the runtime venv:
+>
+> ```bash
+> python3 -m venv /tmp/yolo-export
+> /tmp/yolo-export/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+> /tmp/yolo-export/bin/pip install "ultralytics<8.4" onnx onnxslim onnxruntime
+> export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1   # lets torch>=2.6 unpickle this checkpoint
+> /tmp/yolo-export/bin/python Tools/export_onnx.py --imgsz 640
+> /tmp/yolo-export/bin/python Tools/export_onnx.py --imgsz 448
+> IMG=$(/tmp/yolo-export/bin/python -c "from ultralytics.utils import ASSETS; print(ASSETS/'bus.jpg')")
+> /tmp/yolo-export/bin/python Tools/export_onnx.py --imgsz 640 --verify-only --verify $IMG
+> rm -rf /tmp/yolo-export
+> ```
+>
+> Python 3.13 has no torch 2.4 wheels, hence the env var instead of the pin. Verified with
+> torch 2.14 + ultralytics 8.3.253: both sizes PASS parity.
 
 Set your portal address and key in a gitignored local config:
 
 ```bash
-cd ~/Freenove_4WD_Smart_Car_Kit_for_Raspberry_Pi/Code/Server
+cd ~/SafetyRobot/Code/Server
 cat > ppe_config.local.json <<'EOF'
 {
   "portal": { "url": "http://192.168.1.50:5050", "api_key": "pick-a-shared-secret" },
@@ -220,7 +240,7 @@ invisible prompt. Run stock `python main.py` once interactively from `Code/Serve
 ## 4. Running
 
 ```bash
-cd ~/Freenove_4WD_Smart_Car_Kit_for_Raspberry_Pi/Code/Server
+cd ~/SafetyRobot/Code/Server
 
 ~/ppe-venv/bin/python ppe_main.py                  # full patrol
 ~/ppe-venv/bin/python ppe_main.py --no-motors -v    # bench test on blocks, verbose trace
@@ -310,7 +330,9 @@ gitignored. The ones worth touching:
 | `cooldown.per_person_s` | 90 | How often a persisting violation is re-reported |
 | `model.evidence_conf.head` | 0.60 | Bar for a bare head to count as proof. Raise if you get false helmets |
 | `patrol.scan_interval_s` | 0.15 | Set from your Stage 3 benchmark |
-| `patrol.cruise_duty` | 700 | Keep ≤800; faster means more blur and bigger current spikes |
+| `patrol.cruise_duty` | 700 (this robot: 1200) | Lowest value that actually moves the robot; 800 stalls it on a ~6.9 V pack. Faster means more blur and bigger current spikes |
+| `patrol.reverse_motors` | false (this robot: true) | Set when positive duty drives *away* from the camera/ultrasonic side. Test: drive forward and watch the ultrasonic distance — it must shrink |
+| `camera.hflip` / `vflip` | false (this robot: true) | Both true = 180° rotation, done in the ISP for free. Judge orientation from the room, not from a photo held up to the camera |
 | `rules.min_person_height_frac` | 0.35 | How close someone must be before absence evidence counts |
 | `dry_run` | false | Snapshot locally, never upload. **Use this for your first session** |
 

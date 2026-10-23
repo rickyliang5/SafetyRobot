@@ -89,9 +89,9 @@ approach is kept in `FW/` — see *Project history* below.)
 
 **No torch or ultralytics on the Pi.** The model is exported to ONNX once on a PC, and the Pi
 runs `onnxruntime` alone: a 15 MB wheel instead of a 2 GB install, ~150 MB RSS instead of ~1 GB,
-and it avoids ultralytics pulling `numpy>=2` into a venv where Raspberry Pi OS's `picamera2` is
-compiled against numpy 1.x — a conflict that breaks camera capture with errors that look exactly
-like a hardware fault.
+and it avoids ultralytics pulling its own numpy into a venv where Raspberry Pi OS's `picamera2` is
+compiled against the system numpy — a conflict that breaks camera capture with errors that look
+exactly like a hardware fault.
 
 ---
 

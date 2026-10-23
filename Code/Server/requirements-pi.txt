@@ -11,9 +11,10 @@
 #
 #   ~/ppe-venv/bin/pip list --local
 #
-# That list must NOT contain numpy or opencv-python. Bookworm's picamera2 is
-# compiled against numpy 1.x, and letting pip pull numpy 2.x in breaks camera
-# capture with ABI errors that look like a hardware fault. If it happens:
+# That list must NOT contain numpy or opencv-python. The apt picamera2 stack is
+# compiled against the distro numpy (1.x Bookworm, 2.x Trixie), and letting pip
+# put a second numpy in the venv breaks camera capture
+# with ABI errors that look like a hardware fault. If it happens:
 #   pip uninstall numpy opencv-python
 #   pip install --no-deps onnxruntime
 #
@@ -26,7 +27,7 @@ onnxruntime>=1.17,<2
 
 # Provided by apt, listed for the record:
 #   python3-opencv     (cv2)
-#   python3-numpy      (numpy 1.x -- do not upgrade)
+#   python3-numpy      (distro numpy -- never pip-install over it)
 #   python3-requests   (uploader)
-#   python3-picamera2  (camera, preinstalled on Bookworm)
+#   python3-picamera2  (camera, preinstalled on Raspberry Pi OS)
 #   python3-gpiozero   (ultrasonic, buzzer, line sensors)
