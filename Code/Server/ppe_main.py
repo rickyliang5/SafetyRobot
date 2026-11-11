@@ -103,6 +103,8 @@ def main() -> int:
     ap.add_argument("--config", help="config path (default: ppe_config.json)")
     ap.add_argument("--no-motors", action="store_true",
                     help="run everything but keep the wheels inert (bench test)")
+    ap.add_argument("--scan-only", action="store_true",
+                    help="slow pan/tilt search, hold on people; wheels disabled")
     ap.add_argument("--simulate", action="store_true",
                     help="no hardware at all; simulated car")
     ap.add_argument("--source", default="auto",
@@ -118,6 +120,8 @@ def main() -> int:
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="per-frame state machine trace")
     args = ap.parse_args()
+    if args.scan_only:
+        args.no_motors = True
 
     from ppe_config import load_config
 
@@ -178,7 +182,7 @@ def main() -> int:
         camera, shared, cfg, store=store,
         frame_buffer=frame_buffer, verbose=args.verbose,
     )
-    drive = PatrolDrive(car, shared, cfg)
+    drive = PatrolDrive(car, shared, cfg, scan_only=args.scan_only)
     uploader = None
     if not (args.no_upload or cfg.dry_run):
         uploader = uploader_from_config(cfg, store)

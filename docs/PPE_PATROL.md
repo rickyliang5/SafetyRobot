@@ -80,7 +80,7 @@ So the two activities take turns, and the robot stops before deciding anything:
 WANDER        cruising, camera fixed forward and steady, inference running
   │ person detected
   ▼
-HOLD          brake → 0.3 s settle → camera_steady = true, hold_granted = true
+HOLD          brake → tilt up → settle → camera_steady = true, hold_granted = true
               only now do frames count toward 5-of-10 agreement
   │ violation confirmed
   ▼
@@ -101,6 +101,46 @@ This resolves three problems with one mechanism:
    driving* compares different scenes and means nothing.
 3. Motion blur, the dominant cause of both missed detections and false positives on a robot
    driving over a hard floor, is eliminated at the moment of decision.
+
+### Looking up from floor level
+
+The patrol now stops to look up every 3 seconds, even if its forward view has
+not detected a person. It also tilts up whenever a person triggers an inspection.
+Servo channel `1` raises the camera to `patrol.scan_tilt` (default **135°**),
+waits `pan_settle_s` before accepting evidence, and holds a periodic scan for at
+least `look_up_dwell_s` (default **3 seconds**) after settling. If a person remains
+visible it can stay stopped until `hold_max_s` expires.
+
+Before driving again it returns to `patrol.tilt` (default **100°**) and waits
+for the bracket to settle before reading the ultrasonic sensor or moving. The
+sonar shares the bracket, so upward readings are not used to navigate.
+
+Calibrate with wheels disabled, from `Code/Server`:
+
+```bash
+python ppe_main.py --no-motors -v
+```
+
+Watch the live view through a full scan cycle. On the stock controls, increasing
+the tilt angle looks up. Confirm this on your mounting, then adjust these keys
+in `ppe_config.local.json` (merge them with any existing settings):
+
+```json
+{
+  "patrol": {
+    "tilt": 100,
+    "scan_tilt": 135,
+    "look_up_interval_s": 3.0,
+    "look_up_dwell_s": 3.0
+  }
+}
+```
+
+`scan_tilt` is an absolute servo angle, not degrees above the horizon. Aim it so
+heads and helmets are visible at your intended inspection distance. Both tilt
+settings must be within **80–150°**, the factory tilt test range; your mounting
+may require a narrower range. Physical motion and image framing need verification
+on the robot; simulation checks the control sequence only.
 
 Note the pan sweep uses **60°/90°/120°**, not upstream's 30°/150°. The factory servo test only
 covers pan 50–110 (`test.py:91-96`), so upstream's own autonomous mode drives the bracket past
@@ -238,6 +278,18 @@ invisible prompt. Run stock `python main.py` once interactively from `Code/Serve
 ---
 
 ## 4. Running
+
+For a stationary upward camera search, run `~/ppe-venv/bin/python ppe_main.py --scan-only --no-upload`.
+This disables the wheels, slowly scans pan 60–110° at tilt 135°, 145° and 150°
+(derived from `patrol.scan_tilt`, capped at 150°), and holds a detected person's
+camera view while following that person until repeated settled frames confirm
+PPE present or missing. An unclear view stays UNKNOWN; losing the selected
+person for three seconds releases the lock without a missing-PPE verdict.
+The live HUD shows PPE UNKNOWN, PRESENT or MISSING (helmet is the configured
+required item by default). Servo commands
+are not calibrated ground-relative elevations; check the actual upward view on
+the live feed. Normal driving patrol stops to look up every 3 seconds, then
+lowers to `patrol.tilt` and waits for settling before reading sonar or moving.
 
 ```bash
 cd ~/SafetyRobot/Code/Server

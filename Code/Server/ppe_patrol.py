@@ -78,6 +78,7 @@ class SharedState:
     camera_steady: bool = True
     drive_state: str = STOPPED
     pan_angle: int = 90
+    tilt_angle: int | None = None
     sonic_center_cm: float = SONIC_CLEAR_CM
     battery_v: float = 0.0
     motors_enabled: bool = True
@@ -90,6 +91,9 @@ class SharedState:
     frames_total: int = 0
     frames_recorded: int = 0
     infer_ms: float = 0.0
+    target_center: tuple[float, float] | None = None
+    target_last_seen: float = 0.0
+    ppe_verdict: str = "UNKNOWN"
 
     # ------------------------------------------------------------- accessors
 
@@ -101,6 +105,7 @@ class SharedState:
                 "camera_steady": self.camera_steady,
                 "request_hold": self.request_hold,
                 "pan_angle": self.pan_angle,
+                "tilt_angle": self.tilt_angle,
                 "sonic_cm": self.sonic_center_cm,
                 "battery_v": self.battery_v,
                 "person_present": self.person_present,
@@ -109,6 +114,9 @@ class SharedState:
                 "frames": self.frames_total,
                 "recorded": self.frames_recorded,
                 "infer_ms": round(self.infer_ms, 1),
+                "target_center": self.target_center,
+                "target_last_seen": self.target_last_seen,
+                "ppe_verdict": self.ppe_verdict,
             }
 
     def may_record(self) -> bool:
@@ -323,13 +331,13 @@ class PatrolDrive(threading.Thread):
     be interleaved.
     """
 
-    def __init__(self, car: CarInterface, shared: SharedState, cfg) -> None:
+    def __init__(self, car: CarInterface, shared: SharedState, cfg, scan_only=False) -> None:
         super().__init__(name="ppe-drive", daemon=True)
         self.car = car
         self.shared = shared
         self.cfg = cfg
         self.p = cfg.patrol
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
         self.state = WANDER
         self._state_since = time.monotonic()
@@ -340,6 +348,19 @@ class PatrolDrive(threading.Thread):
         self._last_distance = SONIC_CLEAR_CM
         self._scan_readings: dict[str, float] = {}
         self._last_battery_check = 0.0
+        self._last_look_up = time.monotonic()
+        self._periodic_hold = False
+        self._tilt_ready_at = 0.0
+        self.scan_only = scan_only
+        # Use the configured upward PPE angle as the lowest search view.
+        # Servo degrees are commands, not calibrated elevation above ground.
+        search_tilts = sorted({self.p.scan_tilt, min(150, self.p.scan_tilt + 10),
+                               min(150, self.p.scan_tilt + 15)})
+        self._search_targets = [(pan, tilt) for row, tilt in enumerate(search_tilts)
+                                for pan in ((60, 90, 110) if row % 2 == 0 else (110, 90, 60))]
+        self._search_index = 0
+        self._search_ready_at = 0.0
+        self._search_lock_until = 0.0
 
     # ------------------------------------------------------------------- loop
 
@@ -347,10 +368,11 @@ class PatrolDrive(threading.Thread):
         print("[drive] patrol started")
         try:
             self._set_pan(self.p.pan_center)
-            self.car.set_servo_pwm("1", self.p.tilt)
-            while not self._stop.is_set():
+            self._set_tilt(self.p.tilt)
+            self._stop_event.wait(self.p.pan_settle_s)
+            while not self._stop_event.is_set():
                 self._tick()
-                self._stop.wait(self.p.tick_s)
+                self._stop_event.wait(self.p.tick_s)
         finally:
             # Always leave the wheels stopped, whatever happened.
             self._brake()
@@ -366,6 +388,9 @@ class PatrolDrive(threading.Thread):
         try:
             now = time.monotonic()
             self._check_battery(now)
+            if self.scan_only and self.state != LOW_BATTERY:
+                self._tick_search(now)
+                return
 
             handler = {
                 WANDER: self._tick_wander,
@@ -384,6 +409,76 @@ class PatrolDrive(threading.Thread):
             except Exception:
                 pass
 
+    def _tick_search(self, now: float) -> None:
+        """Bench search: one degree per tick, settle, inspect, hold on a person."""
+        self._brake()
+        state = self.shared.snapshot()
+        if now < self._search_ready_at:
+            return
+        if self._search_lock_until:
+            lost = now - state["target_last_seen"] > 3.0
+            if state["ppe_verdict"] == "UNKNOWN" and not lost:
+                if not state["camera_steady"]:
+                    self._set_steady(True)
+                    self._search_ready_at = now + 0.5
+                    return
+                center = state["target_center"]
+                if center is not None:
+                    x, y = center
+                    pan = max(60, min(110, state["pan_angle"] + (1 if x > .65 else -1 if x < .35 else 0)))
+                    tilt = max(self.p.scan_tilt, min(150, state["tilt_angle"] + (1 if y < .25 else -1 if y > .65 else 0)))
+                    if (pan, tilt) != (state["pan_angle"], state["tilt_angle"]):
+                        self._set_steady(False)
+                        self._set_pan(pan)
+                        self._set_tilt(tilt)
+                        self._search_ready_at = now + self.p.pan_settle_s
+                        return
+                self._set_steady(True)
+                return
+            self._search_lock_until = 0.0
+            self._search_index = (self._search_index + 1) % len(self._search_targets)
+            with self.shared.lock:
+                self.shared.drive_state = "SEARCHING"
+                self.shared.camera_steady = False
+                self.shared.hold_granted = False
+                self.shared.request_alert = False
+            print(f"[search] PPE {state['ppe_verdict']} ({'target lost' if lost else 'confirmed'}); resuming search")
+            return
+        if state["camera_steady"] and state["person_present"]:
+            self._search_lock_until = float('inf')
+            with self.shared.lock:
+                self.shared.drive_state = "PERSON_FOUND"
+                self.shared.hold_granted = True
+                self.shared.target_last_seen = now
+                self.shared.ppe_verdict = "UNKNOWN"
+                self.shared.target_center = None
+            print("[search] person found; tracking until PPE verdict is confirmed")
+            return
+        pan, tilt = self._search_targets[self._search_index]
+        current_tilt = state["tilt_angle"] or self.p.tilt
+        if state["pan_angle"] != pan or current_tilt != tilt:
+            with self.shared.lock:
+                self.shared.drive_state = "SEARCHING"
+                self.shared.camera_steady = False
+                self.shared.hold_granted = False
+            def step(current, target):
+                return current + (1 if target > current else -1) if current != target else current
+            self._set_pan(step(state["pan_angle"], pan))
+            self._set_tilt(step(current_tilt, tilt))
+            self._search_ready_at = now + max(0.2, self.p.pan_settle_s)
+            return
+        if not state["camera_steady"]:
+            self._set_steady(True)
+            with self.shared.lock:
+                self.shared.hold_granted = True
+                self.shared.drive_state = "INSPECTING"
+            self._search_ready_at = now + max(2.0, self.p.pan_settle_s)
+            return
+        self._search_index = (self._search_index + 1) % len(self._search_targets)
+        self._set_steady(False)
+        with self.shared.lock:
+            self.shared.hold_granted = False
+
     # ----------------------------------------------------------------- states
 
     def _tick_wander(self, now: float) -> None:
@@ -397,6 +492,22 @@ class PatrolDrive(threading.Thread):
             return
         if wants_hold and now >= self._ignore_holds_until:
             self._enter(HOLD)
+            return
+
+        # Restore the sonar's driving angle before reading distance or moving.
+        if self.shared.tilt_angle != self.p.tilt:
+            self._brake()
+            self._set_steady(False)
+            self._set_tilt(self.p.tilt)
+            self._tilt_ready_at = now + self.p.pan_settle_s
+            return
+        if now < self._tilt_ready_at:
+            self._brake()
+            return
+        self._set_steady(True)
+        if now - self._last_look_up >= self.p.look_up_interval_s:
+            self._enter(HOLD)
+            self._periodic_hold = True
             return
 
         distance = self._read_distance()
@@ -471,7 +582,7 @@ class PatrolDrive(threading.Thread):
         self._brake()
 
         if self._phase == 0:
-            if elapsed > 0.30:  # mechanical settle after braking
+            if elapsed > self.p.pan_settle_s:  # braking and upward tilt have settled
                 self._set_pan(self.p.pan_center)
                 self._set_steady(True)
                 with self.shared.lock:
@@ -489,7 +600,10 @@ class PatrolDrive(threading.Thread):
 
         # Release when vision is done, or when the hold has run too long --
         # a robot that stares at a wall forever is worse than one that moves on.
-        if not still_wanted or elapsed > self.p.hold_max_s:
+        scan_done = not self._periodic_hold or (
+            now - self._phase_since >= self.p.look_up_dwell_s
+        )
+        if (not still_wanted and scan_done) or elapsed > self.p.hold_max_s:
             if elapsed > self.p.hold_max_s:
                 print(f"[drive] hold timed out after {self.p.hold_max_s:.0f}s")
             self._release_hold()
@@ -567,6 +681,14 @@ class PatrolDrive(threading.Thread):
             self.shared.drive_state = state
         if state in self._STATIONARY:
             self._brake()
+        if state == HOLD:
+            self._periodic_hold = False
+            self._set_steady(False)
+            self._set_pan(self.p.pan_center)
+            self._set_tilt(self.p.scan_tilt)
+        elif state == WANDER:
+            self._last_look_up = self._state_since
+
 
     def _next_phase(self) -> None:
         self._phase += 1
@@ -583,6 +705,12 @@ class PatrolDrive(threading.Thread):
             self.shared.pan_angle = angle
         if changed:
             self.car.set_servo_pwm("0", angle)
+
+    def _set_tilt(self, angle: int) -> None:
+        # Publish the new position only after the hardware command succeeds.
+        self.car.set_servo_pwm("1", angle)
+        with self.shared.lock:
+            self.shared.tilt_angle = angle
 
     def _set_steady(self, steady: bool) -> None:
         with self.shared.lock:
@@ -628,7 +756,7 @@ class PatrolDrive(threading.Thread):
             self._enter(LOW_BATTERY)
 
     def stop(self, timeout: float = 3.0) -> None:
-        self._stop.set()
+        self._stop_event.set()
         if self.is_alive():
             self.join(timeout)
         try:
@@ -662,11 +790,12 @@ class PatrolVision(threading.Thread):
         self.store = store
         self.frame_buffer = frame_buffer
         self.verbose = verbose
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.detector = None
         self.engine = None
         self.vision_state = None
         self.error: str | None = None
+        self._inspection = None
 
     def _build(self) -> None:
         """Construct the ORT session here, inside the thread.
@@ -706,11 +835,12 @@ class PatrolVision(threading.Thread):
         # heat and the battery drain.
         min_interval = max(0.0, float(self.cfg.patrol.scan_interval_s))
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             loop_start = time.perf_counter()
+            capture_state = self.shared.snapshot()
             frame = self.camera.capture_bgr()
             if frame is None:
-                self._stop.wait(0.1)
+                self._stop_event.wait(0.1)
                 continue
 
             height, width = frame.shape[:2]
@@ -719,7 +849,7 @@ class PatrolVision(threading.Thread):
                 detections = self.detector.detect(frame)
             except Exception as exc:
                 print(f"[vision] inference failed: {exc}")
-                self._stop.wait(0.5)
+                self._stop_event.wait(0.5)
                 continue
             infer_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -728,11 +858,18 @@ class PatrolVision(threading.Thread):
 
             # Only frames captured while stopped and settled count toward
             # N-of-M. Everything else maintains identity but adds no evidence.
-            recording = self.shared.may_record()
+            current_state = self.shared.snapshot()
+            recording = (
+                capture_state["hold_granted"] and capture_state["camera_steady"]
+                and self.shared.may_record()
+                and capture_state["pan_angle"] == current_state["pan_angle"]
+                and capture_state["tilt_angle"] == current_state["tilt_angle"]
+            )
             events = self.vision_state.process(
                 observations, now=time.monotonic(),
                 frame_bgr=frame, record=recording,
             )
+            self._update_inspection(observations, width, height, recording)
             with self.shared.lock:
                 self.shared.frames_total += 1
                 if recording:
@@ -752,11 +889,30 @@ class PatrolVision(threading.Thread):
             # cap halves both heat and battery drain.
             spare = min_interval - (time.perf_counter() - loop_start)
             if spare > 0:
-                self._stop.wait(spare)
+                self._stop_event.wait(spare)
 
         print("[vision] stopped")
 
     # ---------------------------------------------------------------- helpers
+
+    def _update_inspection(self, observations, width, height, recording):
+        from ppe_inspection import InspectionTarget
+
+        if self.shared.snapshot()["drive_state"] != "PERSON_FOUND":
+            self._inspection = None
+            return
+        if self._inspection is None:
+            self._inspection = InspectionTarget(self.cfg)
+        target, verdict = self._inspection.update(observations, time.monotonic(), recording)
+        with self.shared.lock:
+            self.shared.ppe_verdict = verdict
+            if target is not None:
+                box = target.person
+                self.shared.target_center = ((box.x1 + box.x2) / (2 * width),
+                                             (box.y1 + .3 * box.height) / height)
+                self.shared.target_last_seen = self._inspection.last_seen
+            else:
+                self.shared.target_center = None
 
     def _update_person_telemetry(self, observations, frame_h: int, infer_ms: float) -> None:
         trigger = self.cfg.patrol.person_trigger_conf
@@ -831,7 +987,7 @@ class PatrolVision(threading.Thread):
             f"{state['infer_ms']:.0f}ms  {state['sonic_cm']:.0f}cm"
         )
         line2 = (
-            f"violations {state['violations']}  "
+            f"PPE {state['ppe_verdict']} violations {state['violations']}  "
             f"battery {state['battery_v']:.2f}V  "
             f"frames {state['recorded']}/{state['frames']}"
         )
@@ -864,7 +1020,7 @@ class PatrolVision(threading.Thread):
     def stop(self, timeout: float = 5.0) -> None:
         # Flag and join. Never Thread.py:stop_thread -- that injects a ctypes
         # async exception, which would abandon the ORT session and the camera.
-        self._stop.set()
+        self._stop_event.set()
         if self.is_alive():
             self.join(timeout)
         if self.detector is not None:

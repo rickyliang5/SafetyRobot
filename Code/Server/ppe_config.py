@@ -227,7 +227,10 @@ class PatrolConfig:
     pan_center: int = 90
     pan_left: int = 60
     pan_right: int = 120
-    tilt: int = 100
+    tilt: int = 100  # driving / sonar angle
+    scan_tilt: int = 135  # upward PPE view; larger angles raise the stock bracket
+    look_up_interval_s: float = 3.0  # frequent stopped scans for people above floor level
+    look_up_dwell_s: float = 3.0  # minimum observation time for periodic scans
     pan_settle_s: float = 0.35
     hold_max_s: float = 8.0
     post_hold_ignore_s: float = 5.0
@@ -250,6 +253,13 @@ class PatrolConfig:
     PAN_SANE_MAX = 140
 
     def __post_init__(self) -> None:
+        for name in ("tilt", "scan_tilt"):
+            if not 80 <= getattr(self, name) <= 150:
+                raise ValueError(f"patrol.{name} must be in 80..150 degrees")
+        if self.look_up_interval_s <= 0 or self.look_up_dwell_s <= 0:
+            raise ValueError("patrol look-up interval and dwell must be positive")
+        if self.pan_settle_s < 0.30:
+            raise ValueError("patrol.pan_settle_s must be at least 0.30 seconds")
         for name in ("pan_center", "pan_left", "pan_right"):
             angle = getattr(self, name)
             if not self.PAN_SANE_MIN <= angle <= self.PAN_SANE_MAX:

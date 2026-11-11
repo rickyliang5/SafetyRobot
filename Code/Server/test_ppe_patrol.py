@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 import time
 
-from ppe_config import load_config
+from ppe_config import DEFAULT_CONFIG_PATH, load_config
 from ppe_patrol import (
     ALERT,
     BLOCKED_SCAN,
@@ -33,7 +33,7 @@ from ppe_patrol import (
 
 def build(distances=None, **patrol_overrides):
     """A drive controller wired to a simulated car, ready to tick."""
-    cfg = load_config()
+    cfg = load_config(DEFAULT_CONFIG_PATH)
     if patrol_overrides:
         from dataclasses import replace
 
@@ -42,6 +42,7 @@ def build(distances=None, **patrol_overrides):
     shared = SharedState()
     drive = PatrolDrive(car, shared, cfg)
     drive._enter(WANDER)
+    drive._set_tilt(cfg.patrol.tilt)
     return drive, car, shared, cfg
 
 
@@ -189,6 +190,50 @@ def test_hold_only_grants_recording_after_the_robot_settles():
     assert shared.hold_granted is True
     assert shared.camera_steady is True
     assert shared.may_record() is True, "after settling, frames should count"
+
+
+def test_hold_looks_up_before_recording():
+    drive, car, shared, cfg = build(distances=[250.0])
+    shared.ask_hold(True)
+    tick(drive)
+    assert car.motor == (0, 0, 0, 0)
+    assert car.servo_angles["1"] == cfg.patrol.scan_tilt
+    assert not shared.camera_steady
+    assert not shared.may_record()
+    tick(drive, advance=0.4)
+    assert shared.may_record()
+
+
+def test_periodic_scan_looks_up_without_detecting_a_person():
+    drive, car, shared, cfg = build(distances=[250.0])
+    drive._last_look_up -= cfg.patrol.look_up_interval_s + 1
+    tick(drive)
+    assert drive.state == HOLD
+    assert car.servo_angles["1"] == cfg.patrol.scan_tilt
+    tick(drive, advance=0.4)
+    tick(drive)
+    assert drive.state == HOLD, "allow time to detect a person in the upward view"
+    tick(drive, advance=cfg.patrol.look_up_dwell_s + 0.1)
+    assert drive.state == WANDER
+    tick(drive)
+    assert car.servo_angles["1"] == cfg.patrol.tilt
+    assert car.motor == (0, 0, 0, 0), "wait for the sonar bracket to settle"
+    drive._tilt_ready_at -= cfg.patrol.pan_settle_s + 0.1
+    tick(drive)
+    assert car.motor == (cfg.patrol.cruise_duty,) * 4
+    assert not shared.may_record()
+
+
+def test_tilt_rejects_angles_outside_factory_test_range():
+    from ppe_config import PatrolConfig
+    for field in ("tilt", "scan_tilt"):
+        for angle in (79, 151):
+            try:
+                PatrolConfig(**{field: angle})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted unsafe {field}={angle}")
 
 
 def test_hold_centres_the_camera():
@@ -351,12 +396,13 @@ def test_stop_always_leaves_the_wheels_stopped():
 
 
 def test_no_motors_keeps_sensors_live_but_wheels_inert():
-    cfg = load_config()
+    cfg = load_config(DEFAULT_CONFIG_PATH)
     inner = SimulatedCar(scripted_distances=[250.0])
     car = NoMotorCar(inner)
     shared = SharedState()
     drive = PatrolDrive(car, shared, cfg)
     drive._enter(WANDER)
+    drive._set_tilt(cfg.patrol.tilt)
     tick(drive)
 
     assert inner.motor == (0, 0, 0, 0), "no motor command should reach the hardware"
@@ -367,12 +413,13 @@ def test_no_motors_keeps_sensors_live_but_wheels_inert():
 
 
 def test_no_motors_still_runs_the_whole_state_machine():
-    cfg = load_config()
+    cfg = load_config(DEFAULT_CONFIG_PATH)
     inner = SimulatedCar(scripted_distances=[18.0])
     car = NoMotorCar(inner)
     shared = SharedState()
     drive = PatrolDrive(car, shared, cfg)
     drive._enter(WANDER)
+    drive._set_tilt(cfg.patrol.tilt)
     tick(drive)
     assert drive.state == BLOCKED_SCAN
     assert run_until(drive, WANDER, advance=0.5)
@@ -413,6 +460,69 @@ def test_may_record_requires_both_conditions():
 # --------------------------------------------------------------------------
 # runner
 # --------------------------------------------------------------------------
+
+
+def test_search_slow_motion_hold_resume_and_no_wheels():
+    drive, car, shared, cfg = build()
+    drive.scan_only = True
+    now = time.monotonic()
+    drive._tick_search(now)
+    assert not shared.may_record()
+    assert car.motor == (0, 0, 0, 0)
+    assert shared.pan_angle == 89
+    for i in range(1, 80):
+        drive._tick_search(now + i)
+        if shared.snapshot()["drive_state"] == "INSPECTING":
+            break
+    assert shared.may_record()
+    pan, tilt = shared.pan_angle, shared.tilt_angle
+    shared.set_person(True, 0.5)
+    drive._tick_search(now + 100)
+    assert shared.snapshot()["drive_state"] == "PERSON_FOUND"
+    assert (shared.pan_angle, shared.tilt_angle) == (pan, tilt)
+    shared.set_person(False, 0)
+    shared.target_last_seen = now + 101
+    drive._tick_search(now + 101)
+    assert shared.may_record()
+    shared.target_last_seen = now + 114.9
+    drive._tick_search(now + 114.9)
+    assert shared.may_record()
+    assert (shared.pan_angle, shared.tilt_angle) == (pan, tilt)
+    # Uncertain PPE keeps the lock past the old 15-second deadline.
+    shared.set_person(True, 0.5)
+    drive._tick_search(now + 115)
+    assert shared.may_record()
+    shared.ppe_verdict = "PRESENT"
+    drive._tick_search(now + 115.5)
+    assert not shared.may_record()
+    assert shared.snapshot()["drive_state"] == "SEARCHING"
+    drive._tick_search(now + 116)
+    assert (shared.pan_angle, shared.tilt_angle) != (pan, tilt)
+    assert car.motor == (0, 0, 0, 0)
+    assert all(60 <= p <= 110 and cfg.patrol.scan_tilt <= t <= 150
+               for p, t in drive._search_targets)
+    assert sorted({t for _, t in drive._search_targets}) == [135, 145, 150]
+
+
+def test_search_tracks_and_discards_frames_during_correction():
+    drive, car, shared, cfg = build()
+    drive.scan_only = True
+    shared.set_person(True, .5)
+    shared.tilt_angle = 140
+    now = time.monotonic()
+    drive._tick_search(now)
+    shared.target_center = (.8, .2)
+    shared.target_last_seen = now
+    drive._tick_search(now + .1)
+    assert shared.pan_angle == 91
+    assert shared.tilt_angle == 141
+    assert not shared.may_record()
+    assert car.motor == (0, 0, 0, 0)
+    drive._tick_search(now + 1)
+    assert shared.may_record()
+    drive._tick_search(now + 4)
+    assert shared.snapshot()["drive_state"] == "SEARCHING"
+    assert shared.ppe_verdict == "UNKNOWN"
 
 
 def _run() -> int:
