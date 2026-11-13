@@ -14,7 +14,7 @@
   },
 
   "rules": {
-    "required_ppe": ["helmet"]
+    "required_ppe": ["helmet", "eye-protection", "safety-vest"]
   },
 
   "temporal": {

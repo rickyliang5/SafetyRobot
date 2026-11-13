@@ -1,12 +1,14 @@
 """Drive forward slowly and stop before the object in front.
 
 Run from Code/Server, with nothing else using the ultrasonic (stop ppe_main.py):
-    python3 approach_demo.py
+    python3 approach_demo.py            # brake at 20 cm
+    python3 approach_demo.py --stop 6   # creep in and stop just short of it
 
 Reads the ultrasonic directly with lgpio and a hard per-ping timeout, so a
 dead or unplugged sensor stops the robot instead of hanging the loop (gpiozero's
 DistanceSensor blocks forever when no echo ever arrives).
 """
+import argparse
 import signal
 import sys
 import time
@@ -17,9 +19,16 @@ from buzzer import Buzzer
 from motor import Ordinary_Car
 from servo import Servo
 
-STOP_CM = 20.0      # brake when the object is this close
+ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+ap.add_argument("--stop", type=float, default=20.0,
+                help="brake when the object is this close, cm (min 4)")
+args = ap.parse_args()
+
+STOP_CM = max(4.0, args.stop)  # the ultrasonic can't read reliably under ~3 cm
+SLOW_CM = 25.0      # inside this, creep instead of cruising
 MIN_START_CM = 35.0 # refuse to start closer than this
 DUTY = -1500        # negative: on this robot, positive drives AWAY from the sensor side
+CREEP = -1200       # slow final approach; 800 stalls the robot
 MAX_S = 8.0         # hard cap on drive time
 TRIG, ECHO = 27, 22
 
@@ -105,6 +114,8 @@ try:
                 break
             continue
         misses = 0
+        if d <= SLOW_CM:
+            car.set_motor_model(CREEP, CREEP, CREEP, CREEP)
         if d <= STOP_CM:
             print(f"object at {d:.1f} cm -- stopping", flush=True)
             break

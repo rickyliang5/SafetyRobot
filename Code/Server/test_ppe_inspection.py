@@ -1,3 +1,4 @@
+import dataclasses
 import unittest
 from ppe_config import load_config
 from ppe_inspection import InspectionTarget
@@ -10,9 +11,17 @@ def observation(status, box=(100, 100, 200, 400)):
                              items={'helmet': ItemEvidence(status)})
 
 
+def helmet_only_config():
+    # The fake observations carry only a helmet verdict, so pin the required
+    # list instead of inheriting whatever ppe_config.json currently enforces.
+    cfg = load_config()
+    return dataclasses.replace(
+        cfg, rules=dataclasses.replace(cfg.rules, required_ppe=('helmet',)))
+
+
 class InspectionTests(unittest.TestCase):
     def setUp(self):
-        self.target = InspectionTarget(load_config())
+        self.target = InspectionTarget(helmet_only_config())
 
     def test_unknown_never_becomes_missing_from_elapsed_time(self):
         for i in range(100):
@@ -21,7 +30,7 @@ class InspectionTests(unittest.TestCase):
 
     def test_present_and_missing_need_repeated_settled_frames(self):
         for status, result in [('PRESENT', 'PRESENT'), ('MISSING_POSITIVE', 'MISSING')]:
-            target = InspectionTarget(load_config())
+            target = InspectionTarget(helmet_only_config())
             for i in range(20):
                 self.assertEqual(target.update([observation(status)], i, False)[1], 'UNKNOWN')
             for i in range(4):

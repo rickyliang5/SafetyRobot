@@ -422,17 +422,28 @@ class PpeDetector:
 # drawing
 # --------------------------------------------------------------------------
 
-_COLOURS = {
-    "person": (255, 190, 80),
-    "helmet": (80, 220, 110),
-    "head": (70, 90, 255),
-    "safety-vest": (80, 220, 110),
-    "gloves": (80, 220, 110),
-    "hands": (70, 90, 255),
-    "shoes": (80, 220, 110),
-    "foot": (70, 90, 255),
+_GREEN = (90, 210, 120)
+_RED = (60, 60, 240)
+_GREY = (150, 150, 150)
+
+# Short on-screen names for PPE items.
+_ITEM_LABELS = {
+    "helmet": "HELMET",
+    "eye-protection": "GLASSES",
+    "safety-vest": "VEST",
+    "face-mask": "MASK",
+    "ear-protection": "EARS",
 }
-_DEFAULT_COLOUR = (190, 190, 190)
+
+
+def _box(out, d: Detection, colour, label: str | None) -> None:
+    p1 = (int(d.x1), int(d.y1))
+    cv2.rectangle(out, p1, (int(d.x2), int(d.y2)), colour, 2)
+    if label:
+        cv2.putText(
+            out, label, (p1[0], max(12, p1[1] - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1, cv2.LINE_AA,
+        )
 
 
 def annotate(
@@ -441,55 +452,61 @@ def annotate(
     observations: list | None = None,
     show_labels: bool = True,
 ) -> np.ndarray:
-    """Draw boxes and, if given, each person's PPE verdict. Returns a copy."""
+    """Draw each person's enforced PPE items and per-item verdicts. Returns a copy.
+
+    Only boxes that matter are drawn: the PPE that satisfies an item (green),
+    and the uncovered body part that proves it missing (red). Hands, shoes,
+    ears and the person box itself are left off to keep the view readable.
+    """
+    from ppe_classes import PPE_ITEMS
+
     out = frame_bgr.copy()
 
-    for d in dets:
-        if d.name == "person":
-            continue
-        colour = _COLOURS.get(d.name, _DEFAULT_COLOUR)
-        p1 = (int(d.x1), int(d.y1))
-        p2 = (int(d.x2), int(d.y2))
-        cv2.rectangle(out, p1, p2, colour, 1)
-        if show_labels:
-            cv2.putText(
-                out, f"{d.name} {d.conf:.2f}", (p1[0], max(10, p1[1] - 3)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA,
-            )
+    if not observations:
+        # No rule pass: just the PPE classes, so the view is never empty.
+        ppe = {c for present, _ in PPE_ITEMS.values() for c in present}
+        for d in dets:
+            if d.name in ppe:
+                _box(out, d, _GREEN, f"{d.name} {d.conf:.2f}" if show_labels else None)
+        return out
 
-    if observations:
-        for obs in observations:
-            missing = obs.missing_items()
-            # UNKNOWN must not draw as "PPE OK": the live view is how people
-            # judge the detector, and green on an unjudged person misleads.
-            unknown = any(ev.status == "UNKNOWN" for ev in obs.items.values())
-            if missing:
-                colour = (60, 60, 240)
-                label = "NO " + ", ".join(m.upper() for m in missing)
-            elif unknown:
-                colour = (150, 150, 150)
-                label = "CAN'T TELL"
+    for obs in observations:
+        lines = []
+        for item, ev in obs.items.items():
+            present, bare = PPE_ITEMS[item]
+            name = _ITEM_LABELS.get(item, item.upper())
+            if ev.status == "PRESENT":
+                lines.append((f"{name} OK", _GREEN))
+                for cls in present:
+                    for d in obs.attached.get(cls, []):
+                        _box(out, d, _GREEN, f"{name.lower()} {d.conf:.2f}" if show_labels else None)
+            elif ev.is_missing:
+                lines.append((f"NO {name}", _RED))
+                # The uncovered head/face is the evidence; vest has none to show.
+                for cls in bare:
+                    for d in obs.attached.get(cls, []):
+                        _box(out, d, _RED, None)  # the verdict stack names it
             else:
-                colour = (90, 210, 120)
-                label = "PPE OK"
-            p1 = (int(obs.person.x1), int(obs.person.y1))
-            p2 = (int(obs.person.x2), int(obs.person.y2))
-            cv2.rectangle(out, p1, p2, colour, 2)
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            ty = max(th + 4, p1[1])
-            cv2.rectangle(out, (p1[0], ty - th - 4), (p1[0] + tw + 6, ty + 2), colour, -1)
+                # UNKNOWN must never read as OK: the live view is how people
+                # judge the detector.
+                lines.append((f"{name} ?", _GREY))
+
+        # Stack the verdicts just ABOVE the person -- their box starts at the
+        # top of the head, so drawing inside it would hide the evidence boxes.
+        # Fall back to the top edge of the frame when there's no room above.
+        (_, th), _ = cv2.getTextSize("X", cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        step = th + 8
+        x = max(0, int(obs.person.x1))
+        y = max(0, int(obs.person.y1) - step * len(lines) - 2)
+        for text, colour in lines:
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            x0 = min(x, out.shape[1] - tw - 6)
+            cv2.rectangle(out, (x0, y), (x0 + tw + 6, y + th + 6), colour, -1)
             cv2.putText(
-                out, label, (p1[0] + 3, ty - 2),
+                out, text, (x0 + 3, y + th + 2),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA,
             )
-    else:
-        for d in dets:
-            if d.name != "person":
-                continue
-            cv2.rectangle(
-                out, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)),
-                _COLOURS["person"], 2,
-            )
+            y += step
     return out
 
 
