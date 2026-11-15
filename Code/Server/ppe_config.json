@@ -10,7 +10,9 @@
     "conf_default": 0.25,
     "iou_nms": 0.45,
     "intra_op_threads": 3,
-    "person_onnx": "models/ppe_yolo8n_640.onnx"
+    "person_onnx": "models/ppe_yolo8n_640.onnx",
+    "ensemble_ppe": true,
+    "vest_match_iou": 0.3
   },
   "rules": {
     "required_ppe": [

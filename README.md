@@ -1,3 +1,7 @@
+> **Ensemble experiment: `robot/ppe-ensemble`.** Combines SH17 and SafetyVision
+> without adding another inference pass. Vest disagreement becomes UNKNOWN;
+> agreement can still share errors. See [evaluation and test commands](docs/PPE_ENSEMBLE.md).
+
 > **Robot test branch: SafetyVision nano.** This branch uses SafetyVision for
 > PPE and SH17 for person detection, with both ONNX files included. Requires
 > ONNX Runtime 1.18+. See [Pi setup and test commands](docs/ROBOT_SAFETYVISION_TEST.md).

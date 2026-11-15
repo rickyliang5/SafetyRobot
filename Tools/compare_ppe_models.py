@@ -25,7 +25,10 @@ ALIASES = {'helmet': 'helmet', 'hardhat': 'helmet',
 
 
 class Detector:
-    def __init__(self, path, threads=3):
+    def __init__(self, path, threads=3, preprocessing="letterbox"):
+        if preprocessing not in ("letterbox", "stretch"):
+            raise ValueError("unknown preprocessing")
+        self.preprocessing = preprocessing
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = threads
         self.session = ort.InferenceSession(str(path), opts, providers=['CPUExecutionProvider'])
@@ -45,7 +48,11 @@ class Detector:
 
     def detect(self, frame, conf, iou):
         start = time.perf_counter()
-        tensor, ratio, pad = preprocess(frame, (640,640))
+        if self.preprocessing == "stretch":
+            rgb = cv2.resize(frame,(640,640))[:,:,::-1]
+            tensor = np.ascontiguousarray(rgb.transpose(2,0,1),dtype=np.float32)[None]/255.
+        else:
+            tensor, ratio, pad = preprocess(frame, (640,640))
         raw = self.session.run(None, {self.input_name: tensor})[0]
         arr = raw[0]
         nc = len(self.names)
@@ -58,7 +65,11 @@ class Detector:
         selected = scores >= conf
         coords, ids, scores = arr[selected,:4], ids[selected], scores[selected]
         xyxy = np.concatenate((coords[:,:2]-coords[:,2:]/2, coords[:,:2]+coords[:,2:]/2),axis=1)
-        xyxy = unletterbox_boxes(xyxy, ratio, pad, (frame.shape[1],frame.shape[0]))
+        if self.preprocessing == "stretch":
+            xyxy *= np.array([frame.shape[1]/640,frame.shape[0]/640]*2)
+            xyxy = unletterbox_boxes(xyxy,1.,(0.,0.),(frame.shape[1],frame.shape[0]))
+        else:
+            xyxy = unletterbox_boxes(xyxy, ratio, pad, (frame.shape[1],frame.shape[0]))
         dets = []
         for cid in np.unique(ids):
             label = ALIASES.get(self.names[int(cid)].lower())

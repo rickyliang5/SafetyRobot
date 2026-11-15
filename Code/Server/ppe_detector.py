@@ -245,7 +245,15 @@ class PpeDetector:
         intra_op_threads: int = 3,
         providers: list[str] | None = None,
         person_onnx: str | Path | None = None,
+        ensemble_ppe: bool = False,
+        vest_match_iou: float = 0.30,
     ) -> None:
+        if ensemble_ppe and person_onnx is None:
+            raise ValueError("ensemble_ppe requires a reference model")
+        if not 0 < vest_match_iou <= 1:
+            raise ValueError("vest_match_iou must be in (0,1]")
+        self.ensemble_ppe = ensemble_ppe
+        self.vest_match_iou = vest_match_iou
         self.onnx_path = Path(onnx_path)
         if not self.onnx_path.is_file():
             raise FileNotFoundError(
@@ -292,6 +300,9 @@ class PpeDetector:
                         intra_op_threads=intra_op_threads, providers=providers)
             if person_onnx is not None else None
         )
+        if ensemble_ppe and (self.class_names != SAFETYVISION_CLASS_NAMES or
+                             self.person_detector.class_names != CLASS_NAMES):
+            raise ValueError("PPE ensemble requires SafetyVision primary and SH17 reference")
 
     def _verify_class_vocabulary(self) -> None:
         """Accept only the exact known vocabularies, then map to internal labels."""
@@ -336,6 +347,8 @@ class PpeDetector:
             class_conf=model.class_conf,
             intra_op_threads=model.intra_op_threads,
             person_onnx=cfg.resolve_path(model.person_onnx) if model.person_onnx else None,
+            ensemble_ppe=model.ensemble_ppe,
+            vest_match_iou=model.vest_match_iou,
         )
 
     # ------------------------------------------------------------------ infer
@@ -364,7 +377,20 @@ class PpeDetector:
             class_names=self.class_names,
             class_map=self.class_map,
         )
-        if self.person_detector is not None:
+        if self.person_detector is not None and self.ensemble_ppe:
+            from ppe_ensemble import combine_ppe
+            # Internal vest votes must remain available even when a caller's
+            # allowed filter only requests vest: filter canonical outputs later.
+            if allowed is not None:
+                detections = decode_v8(
+                    raw, ratio, pad, (w,h), self.conf, self.iou,
+                    self.class_conf if apply_class_conf else None,
+                    class_names=self.class_names, class_map=self.class_map)
+            reference = self.person_detector.detect(frame_bgr, apply_class_conf=apply_class_conf)
+            detections = combine_ppe(detections, reference, self.vest_match_iou, self.iou)
+            if allowed is not None:
+                detections = [d for d in detections if d.cls_id in allowed]
+        elif self.person_detector is not None:
             # This candidate's Person class is weak. Use SH17 people as owners
             # while retaining only candidate PPE/missing-PPE detections.
             detections = [d for d in detections if d.name != "person"]
@@ -457,6 +483,7 @@ _COLOURS = {
     **{name: (70, 90, 255) for name in ("no-helmet", "no-vest", "no-gloves", "no-glasses", "no-mask")},
     "helmet": (80, 220, 110),
     "head": (70, 90, 255),
+    "uncertain-vest": (0, 190, 255),
     "safety-vest": (80, 220, 110),
     "gloves": (80, 220, 110),
     "hands": (70, 90, 255),
@@ -551,6 +578,8 @@ def _main() -> int:
         class_conf=cfg.model.class_conf,
         intra_op_threads=args.threads or cfg.model.intra_op_threads,
         person_onnx=cfg.resolve_path(cfg.model.person_onnx) if cfg.model.person_onnx else None,
+        ensemble_ppe=cfg.model.ensemble_ppe,
+        vest_match_iou=cfg.model.vest_match_iou,
     )
     print(f"model {det.onnx_path.name}  input {det.input_size}")
 

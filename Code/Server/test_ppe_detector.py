@@ -423,6 +423,7 @@ def test_separate_person_model_replaces_candidate_person_boxes():
         calls.append(kwargs)
         return [reference_person]
     detector.person_detector = SimpleNamespace(detect=people)
+    detector.ensemble_ppe = False
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     dets = detector.detect(frame)
     assert [d for d in dets if d.name == "person"] == [reference_person]
@@ -431,6 +432,15 @@ def test_separate_person_model_replaces_candidate_person_boxes():
     calls.clear()
     dets = detector.detect(frame, allowed={CLASS_IDS["helmet"]})
     assert len(dets) == 1 and dets[0].name == "helmet" and not calls
+    detector.ensemble_ppe = True
+    detector.vest_match_iou = .3
+    calls.clear()
+    dets = detector.detect(frame, allowed={CLASS_IDS["helmet"]})
+    assert len(dets) == 1 and dets[0].name == "helmet"
+    assert len(calls) == 1 and "allowed" not in calls[0]
+    dets = detector.detect(frame, allowed={CLASS_IDS["person"]})
+    assert dets == [reference_person]
+
 
 
 if __name__ == "__main__":

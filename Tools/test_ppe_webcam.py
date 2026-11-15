@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TITLE = 'SafetyRobot - Laptop PPE Test (Q or Esc to stop)'
 # Only worn PPE is shown. Person/body-part and missing-PPE classes are excluded.
 comparison.ALIASES.update({'gloves':'gloves', 'goggles':'goggles', 'mask':'mask'})
-COLORS = {'helmet':(240,190,30), 'vest':(50,220,70),
+COLORS = {'helmet':(240,190,30), 'vest':(50,220,70), 'vest?':(0,190,255),
           'gloves':(220,100,220), 'goggles':(70,210,240), 'mask':(200,180,70)}
 
 
@@ -44,6 +44,7 @@ def open_capture(camera, video):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--camera',type=int,default=0)
+    ap.add_argument('--ensemble',action='store_true',help='use the configured two-model PPE ensemble')
     ap.add_argument('--model',type=Path,default=ROOT/'Code/Server/models/ppe_safetyvision_nano_640.onnx')
     ap.add_argument('--conf',type=float,default=.25)
     ap.add_argument('--video',type=Path,help='use a local video instead of the camera')
@@ -55,7 +56,17 @@ def main():
     if args.headless and not args.video and args.max_frames == 0:
         ap.error('headless camera testing requires --max-frames')
     print(f'Loading model: {args.model}',flush=True)
-    model = comparison.Detector(args.model)
+    if args.ensemble:
+        from ppe_config import load_config
+        from ppe_detector import PpeDetector
+        from dataclasses import replace
+        cfg=load_config()
+        if not cfg.model.ensemble_ppe:
+            ap.error('--ensemble requires model.ensemble_ppe enabled in config')
+        cfg=replace(cfg,model=replace(cfg.model,conf_default=.01))
+        model=PpeDetector.from_config(cfg)
+    else:
+        model = comparison.Detector(args.model)
     cap = None
     count = 0
     last_tick = time.perf_counter()
@@ -67,12 +78,23 @@ def main():
             cv2.createTrackbar('Confidence %',TITLE,round(args.conf*100),100,lambda _:None)
         while True:
             conf = args.conf if args.headless else max(.01,cv2.getTrackbarPos('Confidence %',TITLE)/100)
-            dets = model.detect(frame,conf,.45)
-            infer_ms = model.timings[-1]
-            model.timings.clear()  # Keep memory bounded during long camera sessions.
+            if args.ensemble:
+                start=time.perf_counter()
+                # Both models use the slider gate, with no higher per-class
+                # display gate, so the confidence control remains predictable.
+                model.conf=conf
+                model.person_detector.conf=conf
+                raw=model.detect(frame,apply_class_conf=False)
+                dets=[('vest?' if d.name=='uncertain-vest' else 'vest' if d.name=='safety-vest' else d.name,d.conf,d.xyxy)
+                      for d in raw if d.name in ('helmet','safety-vest','uncertain-vest','gloves','glasses','face-mask','shoes','ear-mufs')]
+                infer_ms=(time.perf_counter()-start)*1000
+            else:
+                dets = model.detect(frame,conf,.45)
+                infer_ms = model.timings[-1]
+                model.timings.clear()  # Keep memory bounded during long camera sessions.
             count += 1
             if count == 1:
-                print(f'READY: {frame.shape[1]}x{frame.shape[0]}; camera={args.camera if not args.video else args.video}; worn PPE only; no recording',flush=True)
+                print(f'READY: {frame.shape[1]}x{frame.shape[0]}; camera={args.camera if not args.video else args.video}; PPE preview; no recording',flush=True)
             if not args.headless:
                 view = frame.copy()
                 for label,score,box in dets:
@@ -86,7 +108,8 @@ def main():
                 now = time.perf_counter()
                 fps = 1/max(now-last_tick,1e-6)
                 last_tick = now
-                banner = f'SafetyVision nano | threshold {conf:.0%} | {fps:.1f} FPS | {infer_ms:.0f} ms | Q/Esc: stop'
+                mode='SH17 + SafetyVision (vest? = uncertain)' if args.ensemble else 'SafetyVision nano'
+                banner = f'{mode} | threshold {conf:.0%} | {fps:.1f} FPS | Q/Esc: stop'
                 cv2.rectangle(view,(0,0),(view.shape[1],34),(25,25,25),-1)
                 cv2.putText(view,banner,(10,24),cv2.FONT_HERSHEY_SIMPLEX,.5,(255,255,255),1)
                 cv2.imshow(TITLE,view)
@@ -101,6 +124,8 @@ def main():
                     break
                 raise RuntimeError('camera stopped delivering frames')
     finally:
+        if args.ensemble:
+            model.close()
         if cap is not None:
             cap.release()
         if not args.headless:

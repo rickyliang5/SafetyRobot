@@ -228,7 +228,7 @@ class RuleEngine:
 
         explicit_names = PPE_VIOLATIONS.get(item, ())
         ambiguous = obs.attached.get("__ambiguous__", [])
-        if any(a.name in satisfied_by or a.name in proven_missing_by or a.name in explicit_names for a in ambiguous):
+        if any(a.name in satisfied_by or a.name in proven_missing_by or a.name in explicit_names or (item == "safety-vest" and a.name == "uncertain-vest") for a in ambiguous):
             return ItemEvidence(
                 "UNKNOWN",
                 {},
@@ -277,6 +277,13 @@ class RuleEngine:
                 {worn.name: worn.conf},
                 f"{worn.name} detected at {worn.conf:.2f}",
             )
+
+        # A single-model vest vote is neither proof of wearing nor proof of
+        # missing PPE. Presence from an agreed box above has precedence.
+        if item == "safety-vest" and obs.attached.get("uncertain-vest"):
+            uncertain = self._best(obs, ("uncertain-vest",))
+            return ItemEvidence("UNKNOWN", {"uncertain-vest": uncertain.conf},
+                                "models disagree about vest presence")
 
         # Explicit NO-* predictions are model classifications, not bare body
         # parts. Never translate their potentially person-sized boxes to heads.

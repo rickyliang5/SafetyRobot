@@ -60,6 +60,8 @@ SAFETYVISION_CLASS_MAP = {
     "Person": "person", "Safety Vest": "safety-vest",
 }
 
+CLASS_IDS["uncertain-vest"] = len(CLASS_IDS)
+
 PERSON = "person"
 
 # The model has no "no-helmet" class. Violations are inferred from the geometry
