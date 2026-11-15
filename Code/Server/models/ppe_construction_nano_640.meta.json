@@ -1,0 +1,21 @@
+{
+  "source": "https://huggingface.co/mancalazure/construction-ppe-safety/resolve/main/best.onnx",
+  "model_card": "https://huggingface.co/mancalazure/construction-ppe-safety",
+  "variant": "Kaggle-trained construction YOLOv8n, stock raw-output export (not DeepStream)",
+  "sha256": "1d5f3cf69883e89ba6e2b3836a0b21623044e9a682f1f00dfbacac97b99baf94",
+  "preprocessing": "stretch 640x640, BGR to RGB, float32 /255",
+  "input": [
+    1,
+    3,
+    640,
+    640
+  ],
+  "output": [
+    1,
+    14,
+    8400
+  ],
+  "license_metadata": "AGPL-3.0",
+  "model_card_weights_license": "CC BY 4.0 (author claim); original project snehilsanyal/Construction-Site-Safety-PPE-Detection, Roboflow construction-site-safety v28",
+  "notes": "Class IDs verified against embedded metadata. Attribution/source retained; do not use the incompatible DeepStream export."
+}

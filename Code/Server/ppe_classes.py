@@ -60,6 +60,17 @@ SAFETYVISION_CLASS_MAP = {
     "Person": "person", "Safety Vest": "safety-vest",
 }
 
+CONSTRUCTION_CLASS_NAMES = (
+    "Hardhat", "Mask", "NO-Hardhat", "NO-Mask", "NO-Safety Vest",
+    "Person", "Safety Cone", "Safety Vest", "machinery", "vehicle",
+)
+CONSTRUCTION_CLASS_MAP = {
+    "Hardhat": "helmet", "Mask": "face-mask", "NO-Hardhat": "no-helmet",
+    "NO-Mask": "no-mask", "NO-Safety Vest": "no-vest", "Person": "person",
+    "Safety Cone": None, "Safety Vest": "safety-vest", "machinery": None,
+    "vehicle": None,
+}
+
 CLASS_IDS["uncertain-vest"] = len(CLASS_IDS)
 
 PERSON = "person"

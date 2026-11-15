@@ -12,7 +12,8 @@
     "intra_op_threads": 3,
     "person_onnx": "models/ppe_yolo8n_640.onnx",
     "ensemble_ppe": true,
-    "vest_match_iou": 0.3
+    "vest_match_iou": 0.3,
+    "construction_onnx": "models/ppe_construction_nano_640.onnx"
   },
   "rules": {
     "required_ppe": [

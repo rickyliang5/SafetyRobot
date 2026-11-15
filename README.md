@@ -1,3 +1,8 @@
+> **Three-model test: `robot/ppe-ensemble-construction`.** Includes SH17,
+> SafetyVision and the Kaggle construction nano. Uses two-of-three vest voting.
+> See [Pi setup and current integration](docs/PPE_THREE_MODEL_TEST.md).
+> The ensemble notes below describe earlier experiments.
+
 > **Ensemble experiment: `robot/ppe-ensemble`.** Combines SH17 and SafetyVision
 > without adding another inference pass. Vest disagreement becomes UNKNOWN;
 > agreement can still share errors. See [evaluation and test commands](docs/PPE_ENSEMBLE.md).

@@ -1,43 +1,54 @@
-﻿"""Conservative, per-class fusion of SH17 and SafetyVision detections.
-
-Two-model vest agreement is an experimental precision/recall tradeoff, not a
-probability estimate. Disagreement is explicit UNKNOWN evidence downstream.
-"""
+﻿"""Per-class PPE fusion with one vote per model and explicit disagreement."""
 from __future__ import annotations
 from ppe_classes import CLASS_IDS
 from ppe_types import Detection, iou
 
 
-def combine_ppe(primary, reference, vest_match_iou=.30, nms_iou=.45):
-    """Use SH17 people/body parts, merge PPE, and require two-model vest agreement.
+def combine_ppe(primary, reference, vest_match_iou=.30, nms_iou=.45, additional=None):
+    """Accept vest agreement from any two models; preserve single votes as UNKNOWN.
 
-    Match vest boxes one-to-one, highest IoU first. Confidence is the weaker
-    input score; agreeing models do not inflate it. Disagreeing boxes retain
-    their location as uncertain-vest markers. They are not worn-PPE detections.
+    Greedily match highest-IoU pairs across distinct models, then attach at most
+    one third-model vote if it overlaps every member. Each detection votes once.
+    Scores are the second-highest input score, not an inflated probability.
+    SH17/reference alone supplies people; PPE from every model is retained.
     """
-    primary_vests = [d for d in primary if d.name == 'safety-vest']
-    reference_vests = [d for d in reference if d.name == 'safety-vest']
-    pairs = sorted(((iou(a.xyxy,b.xyxy),i,j) for i,a in enumerate(primary_vests)
-                    for j,b in enumerate(reference_vests)), reverse=True)
-    used_primary,used_reference = set(),set()
+    sources=[primary,reference]
+    if additional is not None:
+        sources.append(additional)
+    votes=[[d for d in src if d.name=='safety-vest'] for src in sources]
+    edges=[]
+    for a in range(len(votes)):
+        for b in range(a+1,len(votes)):
+            edges.extend((iou(x.xyxy,y.xyxy),a,i,b,j) for i,x in enumerate(votes[a])
+                         for j,y in enumerate(votes[b]))
+    used=set()
     vests=[]
-    for overlap,i,j in pairs:
-        if overlap < vest_match_iou or i in used_primary or j in used_reference:
+    for overlap,a,i,b,j in sorted(edges,reverse=True):
+        if overlap<vest_match_iou or (a,i) in used or (b,j) in used:
             continue
-        used_primary.add(i)
-        used_reference.add(j)
-        a,b=primary_vests[i],reference_vests[j]
-        box=tuple((x+y)/2 for x,y in zip(a.xyxy,b.xyxy))
-        vests.append(Detection(CLASS_IDS['safety-vest'],'safety-vest',min(a.conf,b.conf),box))
-    for detections,used in ((primary_vests,used_primary),(reference_vests,used_reference)):
-        for i,d in enumerate(detections):
-            if i not in used:
+        cluster=[(a,i),(b,j)]
+        used.update(cluster)
+        for c in range(len(votes)):
+            if c in (a,b):
+                continue
+            compatible=[(min(iou(d.xyxy,votes[s][k].xyxy) for s,k in cluster),n)
+                        for n,d in enumerate(votes[c]) if (c,n) not in used]
+            if compatible:
+                similarity,n=max(compatible)
+                if similarity>=vest_match_iou:
+                    cluster.append((c,n))
+                    used.add((c,n))
+        matched=[votes[s][k] for s,k in cluster]
+        box=tuple(sum(d.xyxy[k] for d in matched)/len(matched) for k in range(4))
+        score=sorted((d.conf for d in matched),reverse=True)[1]
+        vests.append(Detection(CLASS_IDS['safety-vest'],'safety-vest',score,box))
+    for s,source in enumerate(votes):
+        for k,d in enumerate(source):
+            if (s,k) not in used:
                 vests.append(Detection(CLASS_IDS['uncertain-vest'],'uncertain-vest',d.conf,d.xyxy))
-    # Original body-part evidence remains available; candidate explicit NO-*
-    # classes keep their own names and evidence thresholds. People come only
-    # from SH17, avoiding the candidate's weak Person class.
-    pooled=[d for d in primary if d.name not in ('person','safety-vest')]
-    pooled += [d for d in reference if d.name != 'safety-vest']
+    pooled=[]
+    for s,source in enumerate(sources):
+        pooled.extend(d for d in source if d.name!='safety-vest' and (d.name!='person' or s==1))
     kept=[]
     for d in sorted(pooled,key=lambda d:d.conf,reverse=True):
         if not any(k.name==d.name and iou(k.xyxy,d.xyxy)>nms_iou for k in kept):

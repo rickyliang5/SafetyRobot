@@ -54,6 +54,7 @@ class ModelConfig:
     scan_onnx: str = "models/ppe_safetyvision_nano_640.onnx"
     confirm_onnx: str = "models/ppe_safetyvision_nano_640.onnx"
     person_onnx: str | None = None  # optional separate person detector
+    construction_onnx: str | None = None
     ensemble_ppe: bool = False
     vest_match_iou: float = 0.30
     pt_path: str = "../../yolo8n.pt"
@@ -104,6 +105,8 @@ class ModelConfig:
             raise ValueError("model.ensemble_ppe must be a boolean")
         if not 0 < self.vest_match_iou <= 1:
             raise ValueError("model.vest_match_iou must be in (0,1]")
+        if self.construction_onnx and not self.ensemble_ppe:
+            raise ValueError("model.construction_onnx requires ensemble_ppe")
         if self.ensemble_ppe and not self.person_onnx:
             raise ValueError("model.ensemble_ppe requires model.person_onnx")
         for mapping in (self.class_conf, self.evidence_conf, self.veto_conf):

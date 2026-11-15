@@ -41,7 +41,8 @@ import cv2
 import numpy as np
 
 from ppe_classes import (CLASS_NAMES, CLASS_IDS, NUM_CLASSES,
-                         SAFETYVISION_CLASS_NAMES, SAFETYVISION_CLASS_MAP)
+                         SAFETYVISION_CLASS_NAMES, SAFETYVISION_CLASS_MAP,
+                         CONSTRUCTION_CLASS_NAMES, CONSTRUCTION_CLASS_MAP)
 from ppe_types import Detection
 
 PAD_VALUE = 114  # ultralytics' letterbox grey; must match training
@@ -121,6 +122,13 @@ def preprocess(img_bgr: np.ndarray, size: tuple[int, int]):
 # --------------------------------------------------------------------------
 # postprocessing
 # --------------------------------------------------------------------------
+
+
+def preprocess_stretch(img_bgr: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Construction nano uses direct resize rather than letterbox padding."""
+    resized = cv2.resize(img_bgr, size, interpolation=cv2.INTER_LINEAR)
+    rgb = resized[:, :, ::-1]
+    return np.ascontiguousarray(rgb.transpose(2, 0, 1), dtype=np.float32)[None] / 255.0
 
 
 def nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> list[int]:
@@ -245,9 +253,12 @@ class PpeDetector:
         intra_op_threads: int = 3,
         providers: list[str] | None = None,
         person_onnx: str | Path | None = None,
+        construction_onnx: str | Path | None = None,
         ensemble_ppe: bool = False,
         vest_match_iou: float = 0.30,
     ) -> None:
+        if construction_onnx and not ensemble_ppe:
+            raise ValueError("construction_onnx requires ensemble_ppe")
         if ensemble_ppe and person_onnx is None:
             raise ValueError("ensemble_ppe requires a reference model")
         if not 0 < vest_match_iou <= 1:
@@ -303,11 +314,19 @@ class PpeDetector:
         if ensemble_ppe and (self.class_names != SAFETYVISION_CLASS_NAMES or
                              self.person_detector.class_names != CLASS_NAMES):
             raise ValueError("PPE ensemble requires SafetyVision primary and SH17 reference")
+        self.construction_detector = (
+            PpeDetector(construction_onnx, conf=conf, iou=iou, class_conf=class_conf,
+                        intra_op_threads=intra_op_threads, providers=providers)
+            if construction_onnx is not None else None
+        )
+        if self.construction_detector is not None and self.construction_detector.class_names != CONSTRUCTION_CLASS_NAMES:
+            raise ValueError("construction_onnx must use the known construction nano vocabulary")
 
     def _verify_class_vocabulary(self) -> None:
         """Accept only the exact known vocabularies, then map to internal labels."""
         self.class_names = CLASS_NAMES
         self.class_map = None
+        self.preprocessing = "letterbox"
         meta = self.session.get_modelmeta().custom_metadata_map or {}
         raw = meta.get("names")
         if not raw:
@@ -328,6 +347,12 @@ class PpeDetector:
             raise ValueError("invalid model class metadata; refusing to guess") from exc
         if got == CLASS_NAMES:
             return
+        if got == CONSTRUCTION_CLASS_NAMES:
+            self.class_names = got
+            self.class_map = CONSTRUCTION_CLASS_MAP
+            self.preprocessing = "stretch"
+            print("[detector] Kaggle construction nano: class adapter and stretch input active")
+            return
         if got == SAFETYVISION_CLASS_NAMES:
             self.class_names = got
             self.class_map = SAFETYVISION_CLASS_MAP
@@ -347,6 +372,7 @@ class PpeDetector:
             class_conf=model.class_conf,
             intra_op_threads=model.intra_op_threads,
             person_onnx=cfg.resolve_path(model.person_onnx) if model.person_onnx else None,
+            construction_onnx=cfg.resolve_path(model.construction_onnx) if model.construction_onnx else None,
             ensemble_ppe=model.ensemble_ppe,
             vest_match_iou=model.vest_match_iou,
         )
@@ -363,13 +389,20 @@ class PpeDetector:
         if frame_bgr is None or frame_bgr.size == 0:
             return []
         h, w = frame_bgr.shape[:2]
-        blob, ratio, pad = preprocess(frame_bgr, self.input_size)
+        stretched = self.preprocessing == "stretch"
+        if stretched:
+            blob = preprocess_stretch(frame_bgr, self.input_size)
+            ratio, pad = 1.0, (0.0, 0.0)
+            decode_wh = self.input_size
+        else:
+            blob, ratio, pad = preprocess(frame_bgr, self.input_size)
+            decode_wh = (w, h)
         raw = self.session.run(self.output_names, {self.input_name: blob})[0]
         detections = decode_v8(
             raw,
             ratio,
             pad,
-            (w, h),
+            decode_wh,
             conf_floor=self.conf,
             iou_thr=self.iou,
             class_conf=self.class_conf if apply_class_conf else None,
@@ -377,6 +410,11 @@ class PpeDetector:
             class_names=self.class_names,
             class_map=self.class_map,
         )
+        if stretched:
+            sx, sy = w / self.input_size[0], h / self.input_size[1]
+            detections = [Detection(d.cls_id, d.name, d.conf,
+                                   (d.x1*sx, d.y1*sy, d.x2*sx, d.y2*sy))
+                          for d in detections]
         if self.person_detector is not None and self.ensemble_ppe:
             from ppe_ensemble import combine_ppe
             # Internal vest votes must remain available even when a caller's
@@ -387,7 +425,10 @@ class PpeDetector:
                     self.class_conf if apply_class_conf else None,
                     class_names=self.class_names, class_map=self.class_map)
             reference = self.person_detector.detect(frame_bgr, apply_class_conf=apply_class_conf)
-            detections = combine_ppe(detections, reference, self.vest_match_iou, self.iou)
+            additional = (self.construction_detector.detect(frame_bgr, apply_class_conf=apply_class_conf)
+                          if self.construction_detector is not None else None)
+            detections = combine_ppe(detections, reference, self.vest_match_iou, self.iou,
+                                     additional=additional)
             if allowed is not None:
                 detections = [d for d in detections if d.cls_id in allowed]
         elif self.person_detector is not None:
@@ -469,6 +510,8 @@ class PpeDetector:
         }
 
     def close(self) -> None:
+        if self.construction_detector is not None:
+            self.construction_detector.close()
         if self.person_detector is not None:
             self.person_detector.close()
         self.session = None
@@ -578,6 +621,7 @@ def _main() -> int:
         class_conf=cfg.model.class_conf,
         intra_op_threads=args.threads or cfg.model.intra_op_threads,
         person_onnx=cfg.resolve_path(cfg.model.person_onnx) if cfg.model.person_onnx else None,
+        construction_onnx=cfg.resolve_path(cfg.model.construction_onnx) if cfg.model.construction_onnx else None,
         ensemble_ppe=cfg.model.ensemble_ppe,
         vest_match_iou=cfg.model.vest_match_iou,
     )

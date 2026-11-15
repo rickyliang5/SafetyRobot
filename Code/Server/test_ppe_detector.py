@@ -411,6 +411,8 @@ def test_separate_person_model_replaces_candidate_person_boxes():
     raw[0, 4 + 3, 1] = .9   # candidate helmet (must survive)
     detector = PpeDetector.__new__(PpeDetector)
     detector.input_size = (640, 640)
+    detector.preprocessing = "letterbox"
+    detector.construction_detector = None
     detector.input_name = "images"
     detector.output_names = ["output0"]
     detector.class_names = SAFETYVISION_CLASS_NAMES
@@ -441,6 +443,53 @@ def test_separate_person_model_replaces_candidate_person_boxes():
     dets = detector.detect(frame, allowed={CLASS_IDS["person"]})
     assert dets == [reference_person]
 
+
+
+
+def test_construction_stretch_is_rgb_without_letterbox_padding():
+    from ppe_detector import preprocess_stretch
+    image=np.zeros((80,160,3),dtype=np.uint8)
+    image[:]=(255,0,0)
+    tensor=preprocess_stretch(image,(640,640))
+    assert tensor.shape==(1,3,640,640) and tensor.dtype==np.float32
+    assert np.all(tensor[0,2]==1.) and np.all(tensor[0,:2]==0.)
+    assert tensor.flags.c_contiguous
+
+
+def test_construction_boxes_map_back_after_nonsquare_stretch():
+    from types import SimpleNamespace
+    from ppe_detector import PpeDetector
+    from ppe_classes import CONSTRUCTION_CLASS_NAMES, CONSTRUCTION_CLASS_MAP
+    detector=PpeDetector.__new__(PpeDetector)
+    detector.input_size=(640,640)
+    detector.preprocessing='stretch'
+    detector.input_name='images'
+    detector.output_names=['output0']
+    detector.class_names=CONSTRUCTION_CLASS_NAMES
+    detector.class_map=CONSTRUCTION_CLASS_MAP
+    detector.conf,detector.iou,detector.class_conf=.25,.45,{}
+    detector.person_detector=detector.construction_detector=None
+    detector.ensemble_ppe=False
+    raw=np.zeros((1,14,1),dtype=np.float32)
+    raw[0,:4,0]=[320,320,320,320]
+    raw[0,4+7,0]=.8
+    detector.session=SimpleNamespace(run=lambda *a:[raw])
+    dets=detector.detect(np.zeros((240,1280,3),dtype=np.uint8))
+    assert len(dets)==1 and dets[0].name=='safety-vest'
+    np.testing.assert_allclose(dets[0].xyxy,(320.,60.,960.,180.))
+    assert dets[0].cls_id==CLASS_IDS['safety-vest']
+
+
+def test_construction_model_vocabulary_selects_stretch_adapter():
+    from types import SimpleNamespace
+    from ppe_detector import PpeDetector
+    from ppe_classes import CONSTRUCTION_CLASS_NAMES,CONSTRUCTION_CLASS_MAP
+    detector=PpeDetector.__new__(PpeDetector)
+    meta={'names':repr(dict(enumerate(CONSTRUCTION_CLASS_NAMES)))}
+    detector.session=SimpleNamespace(get_modelmeta=lambda:SimpleNamespace(custom_metadata_map=meta))
+    detector._verify_class_vocabulary()
+    assert detector.class_map==CONSTRUCTION_CLASS_MAP
+    assert detector.preprocessing=='stretch'
 
 
 if __name__ == "__main__":

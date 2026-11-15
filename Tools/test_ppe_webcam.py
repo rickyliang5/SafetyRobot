@@ -84,6 +84,8 @@ def main():
                 # display gate, so the confidence control remains predictable.
                 model.conf=conf
                 model.person_detector.conf=conf
+                if model.construction_detector is not None:
+                    model.construction_detector.conf=conf
                 raw=model.detect(frame,apply_class_conf=False)
                 dets=[('vest?' if d.name=='uncertain-vest' else 'vest' if d.name=='safety-vest' else d.name,d.conf,d.xyxy)
                       for d in raw if d.name in ('helmet','safety-vest','uncertain-vest','gloves','glasses','face-mask','shoes','ear-mufs')]
@@ -108,7 +110,7 @@ def main():
                 now = time.perf_counter()
                 fps = 1/max(now-last_tick,1e-6)
                 last_tick = now
-                mode='SH17 + SafetyVision (vest? = uncertain)' if args.ensemble else 'SafetyVision nano'
+                mode=('3-model PPE ensemble' if model.construction_detector is not None else 'SH17 + SafetyVision') if args.ensemble else 'SafetyVision nano'
                 banner = f'{mode} | threshold {conf:.0%} | {fps:.1f} FPS | Q/Esc: stop'
                 cv2.rectangle(view,(0,0),(view.shape[1],34),(25,25,25),-1)
                 cv2.putText(view,banner,(10,24),cv2.FONT_HERSHEY_SIMPLEX,.5,(255,255,255),1)

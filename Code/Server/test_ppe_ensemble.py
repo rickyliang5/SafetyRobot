@@ -91,6 +91,55 @@ def test_invalid_ensemble_configuration_is_rejected():
             raise AssertionError(f'must reject {kwargs}')
 
 
+
+def test_any_two_of_three_models_can_confirm_a_vest():
+    for primary,reference,additional in (
+        ([d('safety-vest')],[],[d('safety-vest')]),
+        ([],[d('safety-vest')],[d('safety-vest')]),
+        ([d('safety-vest')],[d('safety-vest')],[]),
+    ):
+        out=combine_ppe(primary,reference,additional=additional)
+        assert len(out)==1 and out[0].name=='safety-vest'
+
+
+def test_third_model_alone_is_not_consensus():
+    out=combine_ppe([],[],additional=[d('safety-vest'),d('safety-vest')])
+    assert len(out)==2 and all(x.name=='uncertain-vest' for x in out)
+
+
+def test_three_votes_use_second_highest_score_not_sum_or_product():
+    out=combine_ppe([d('safety-vest',conf=.9)],[d('safety-vest',conf=.7)],
+                    additional=[d('safety-vest',conf=.3)])
+    assert len(out)==1 and out[0].name=='safety-vest' and out[0].conf==.7
+
+
+def test_third_model_adds_helmet_but_not_person_owners():
+    person=d('person',PERSON)
+    other=d('person',(0.,0.,100.,200.))
+    helmet=d('helmet',(250.,70.,330.,130.))
+    out=combine_ppe([], [person],additional=[other,helmet])
+    assert person in out and helmet in out and other not in out
+
+
+def test_third_vote_cannot_bridge_nonoverlapping_workers():
+    # A big third box overlapping two different vests gets only one vote.
+    a=d('safety-vest',(0.,0.,50.,100.))
+    b=d('safety-vest',(50.,0.,100.,100.))
+    c=d('safety-vest',(0.,0.,100.,100.))
+    out=combine_ppe([a],[b],additional=[c])
+    assert sum(x.name=='safety-vest' for x in out)==1
+    assert sum(x.name=='uncertain-vest' for x in out)==1
+
+
+def test_third_model_requires_ensemble_configuration():
+    try:
+        ModelConfig(construction_onnx='candidate.onnx')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('third model requires ensemble mode')
+
+
 if __name__=='__main__':
     failures=[]
     tests=[(n,f) for n,f in sorted(globals().items()) if n.startswith('test_') and callable(f)]
