@@ -188,8 +188,11 @@ class TemporalConfig:
     positive_n: int = 5  # bare-body-part proof: 5 of 10
     absence_n: int = 8   # absence-only items: stricter, 8 of 10
     min_track_hits: int = 4
+    presence_hold_s: float = 4.0  # keep positive PPE evidence through camera shake
 
     def __post_init__(self) -> None:
+        if not 0 <= self.presence_hold_s < float("inf"):
+            raise ValueError("temporal.presence_hold_s must be finite and nonnegative")
         if not 0 < self.positive_n <= self.window_m:
             raise ValueError("temporal.positive_n must be in 1..window_m")
         if not 0 < self.absence_n <= self.window_m:

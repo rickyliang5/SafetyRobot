@@ -95,6 +95,8 @@ class Track:
     # we then notice also has no gloves.
     item_cooldown: dict[str, float] = field(default_factory=dict)
     signature: object | None = None
+    last_present: dict[str, float] = field(default_factory=dict)
+    presence_hold_s: float = 0.0
 
     def suppressed(self, item: str, now: float) -> bool:
         return now < self.item_cooldown.get(item, float("-inf"))
@@ -185,10 +187,12 @@ class PersonTracker:
         iou_thresh: float = 0.30,
         max_misses: int = 15,
         window: int = 10,
+        presence_hold_s: float = 0.0,
     ) -> None:
         self.iou_thresh = iou_thresh
         self.max_misses = max_misses
         self.window = window
+        self.presence_hold_s = presence_hold_s
         self.tracks: dict[int, Track] = {}
         self._next_id = 1
 
@@ -210,6 +214,10 @@ class PersonTracker:
 
         out: list[tuple[Track, PersonObservation]] = []
         for track, obs in pairs:
+            # A long gap must not carry PPE assumptions into a reacquired identity.
+            if now - track.last_seen > self.presence_hold_s:
+                track.last_present.clear()
+            track.presence_hold_s = self.presence_hold_s
             track.box = obs.person.xyxy
             track.hits += 1
             track.misses = 0
@@ -218,6 +226,8 @@ class PersonTracker:
 
             if record:
                 for item, evidence in obs.items.items():
+                    if evidence.status == "PRESENT":
+                        track.last_present[item] = now
                     track.record(item, evidence.status, self.window)
                 self._maybe_keep_best(track, obs, frame_bgr)
             if track.signature is None and frame_bgr is not None:
@@ -335,7 +345,12 @@ class ViolationConfirmer:
 
         for item in list(track.history):
             positive, absent, present, total = track.counts(item)
-            if total == 0 or present > 0:
+            recent_presence = (
+                track.presence_hold_s > 0
+                and track.last_seen - track.last_present.get(item, float("-inf"))
+                < track.presence_hold_s
+            )
+            if total == 0 or present > 0 or recent_presence:
                 # Presence veto across the window: one confident sighting of
                 # the PPE clears the item outright.
                 continue
@@ -442,7 +457,7 @@ class PatrolVisionState:
     """
 
     def __init__(self, temporal: TemporalConfig, cooldown: CooldownConfig) -> None:
-        self.tracker = PersonTracker(window=temporal.window_m)
+        self.tracker = PersonTracker(window=temporal.window_m, presence_hold_s=temporal.presence_hold_s)
         self.confirmer = ViolationConfirmer(temporal, cooldown)
         self._known: set[int] = set()
 

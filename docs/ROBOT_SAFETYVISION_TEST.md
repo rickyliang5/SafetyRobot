@@ -24,6 +24,17 @@ predictions, not guarantees of compliance or calibrated probabilities.
 
 ## On the Pi
 
+For a camera-only browser preview (no motors, servos, uploads or saved images):
+
+```bash
+cd ~/SafetyRobot-safetyvision/Code/Server
+~/ppe-venv/bin/python ppe_preview.py --config ppe_config.json
+```
+
+Open http://PI_IP:8080/ in a browser. The preview draws live model predictions
+and inference speed. Ctrl-C releases the camera. Use `--duration 15` for a
+short capture check. The camera flips match this robot's mounted orientation.
+
 From your existing SafetyRobot checkout:
 
 ```bash
@@ -72,3 +83,19 @@ in each .meta.json file. Downloads/outputs/webcam recordings are not committed.
 
 To return to the previous robot version, stop the process and switch back to
 main. Your gitignored local configuration and snapshots remain on the Pi.
+
+## Camera preview with PPE memory
+
+Run `~/ppe-venv/bin/python ppe_preview.py --config ppe_config.json` from
+Code/Server and open http://PI_IP:8080. This runs capture and inference without
+motors, uploads or recording. Per-person item labels hold OK for
+`temporal.presence_hold_s` seconds (default 4) after a real positive observation.
+Held labels say OK (recent); only real sightings refresh the timer. UNKNOWN
+and missing detections do not refresh it. After expiry the label becomes
+CHECKING until missing evidence meets the usual confirmation threshold.
+Memory is separate for each tracked person and item, and clears after a long
+observation gap. Raw detection boxes can still flicker; labels show the stable
+assessment. Tracker identity mistakes and incorrect model detections can still
+produce incorrect assessments. This is short-term memory, not a permanent
+assumption that PPE remains worn. The patrol uses the same hold to suppress
+missing-PPE reports, without changing raw observations or evidence counts.

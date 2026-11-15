@@ -40,6 +40,8 @@
     "hold_max_s": 8.0
   },
   "camera": {
+    "hflip": true,
+    "vflip": true,
     "stream_size": [
       640,
       480
