@@ -371,6 +371,29 @@ def test_window_slides_and_drops_old_verdicts():
 # --------------------------------------------------------------------------
 
 
+def test_presence_hold_survives_shake_then_expires():
+    tracker = PersonTracker(window=4, presence_hold_s=4.0)
+    confirmer = ViolationConfirmer(temporal(window_m=4, positive_n=3, absence_n=3), cooldown())
+    tracker.update(observe(helmeted_frame()), now=0.0)
+    for i in range(1, 7):
+        track = tracker.update(observe(bare_head_frame()), now=i * .5)[0][0]
+    assert track.counts('helmet')[2] == 0  # no invented positive frames
+    assert not confirmer.confirmed_items(track)
+    track = tracker.update(observe(bare_head_frame()), now=4.0)[0][0]
+    assert 'helmet' in confirmer.confirmed_items(track)
+
+
+def test_presence_hold_is_per_person_and_expires_after_gap():
+    tracker = PersonTracker(window=4, presence_hold_s=4.0)
+    first = tracker.update(observe(helmeted_frame()), now=0.0)[0][0]
+    far = (20.0, 100.0, 100.0, 400.0)
+    second = tracker.update(observe(bare_head_frame(person=far)), now=.5)[0][0]
+    assert second.track_id != first.track_id
+    assert not second.last_present
+    first = tracker.update(observe(bare_head_frame()), now=5.0)[0][0]
+    assert not first.last_present
+
+
 def _run() -> int:
     tests = [
         (n, f) for n, f in sorted(globals().items())
