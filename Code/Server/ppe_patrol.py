@@ -320,7 +320,7 @@ class PatrolDrive(threading.Thread):
         self.shared = shared
         self.cfg = cfg
         self.p = cfg.patrol
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
         self.state = WANDER
         self._state_since = time.monotonic()
@@ -339,9 +339,9 @@ class PatrolDrive(threading.Thread):
         try:
             self._set_pan(self.p.pan_center)
             self.car.set_servo_pwm("1", self.p.tilt)
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 self._tick()
-                self._stop.wait(self.p.tick_s)
+                self._stop_event.wait(self.p.tick_s)
         finally:
             # Always leave the wheels stopped, whatever happened.
             self._brake()
@@ -619,7 +619,7 @@ class PatrolDrive(threading.Thread):
             self._enter(LOW_BATTERY)
 
     def stop(self, timeout: float = 3.0) -> None:
-        self._stop.set()
+        self._stop_event.set()
         if self.is_alive():
             self.join(timeout)
         try:
@@ -653,7 +653,7 @@ class PatrolVision(threading.Thread):
         self.store = store
         self.frame_buffer = frame_buffer
         self.verbose = verbose
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.detector = None
         self.engine = None
         self.vision_state = None
@@ -697,11 +697,11 @@ class PatrolVision(threading.Thread):
         # heat and the battery drain.
         min_interval = max(0.0, float(self.cfg.patrol.scan_interval_s))
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             loop_start = time.perf_counter()
             frame = self.camera.capture_bgr()
             if frame is None:
-                self._stop.wait(0.1)
+                self._stop_event.wait(0.1)
                 continue
 
             height, width = frame.shape[:2]
@@ -710,7 +710,7 @@ class PatrolVision(threading.Thread):
                 detections = self.detector.detect(frame)
             except Exception as exc:
                 print(f"[vision] inference failed: {exc}")
-                self._stop.wait(0.5)
+                self._stop_event.wait(0.5)
                 continue
             infer_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -743,7 +743,7 @@ class PatrolVision(threading.Thread):
             # cap halves both heat and battery drain.
             spare = min_interval - (time.perf_counter() - loop_start)
             if spare > 0:
-                self._stop.wait(spare)
+                self._stop_event.wait(spare)
 
         print("[vision] stopped")
 
@@ -855,7 +855,7 @@ class PatrolVision(threading.Thread):
     def stop(self, timeout: float = 5.0) -> None:
         # Flag and join. Never Thread.py:stop_thread -- that injects a ctypes
         # async exception, which would abandon the ORT session and the camera.
-        self._stop.set()
+        self._stop_event.set()
         if self.is_alive():
             self.join(timeout)
         if self.detector is not None:

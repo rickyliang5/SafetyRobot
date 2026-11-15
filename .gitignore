@@ -38,3 +38,12 @@ desktop.ini
 # 70MB .exe). GitHub warns above 50MB and blocks at 100MB, and they are pure
 # convenience: the Python source for that same client is in Code/Client/.
 Application/
+
+# Local PPE test environment and generated evaluation artifacts
+.venv-ppe/
+test_images/
+test_videos/
+ppe_results/
+
+# Candidate model downloads used for local evaluation
+test_models/

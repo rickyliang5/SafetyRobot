@@ -344,6 +344,47 @@ def _run() -> int:
     return 1 if failures else 0
 
 
+
+def test_explicit_no_helmet_is_separate_model_evidence():
+    obs = engine().evaluate_frame([det("person", NEAR_PERSON), det("no-helmet", NEAR_HEAD, .8)], FRAME)
+    assert status(obs) == "MISSING_POSITIVE"
+    assert "no-helmet" in obs[0].items["helmet"].support
+    assert "head" not in obs[0].items["helmet"].support
+
+
+def test_explicit_no_helmet_below_evidence_threshold_is_unknown():
+    obs = engine().evaluate_frame([det("person", NEAR_PERSON), det("no-helmet", NEAR_HEAD, .5)], FRAME)
+    assert status(obs) == "UNKNOWN"
+
+
+def test_helmet_presence_vetoes_conflicting_no_helmet_prediction():
+    obs = engine().evaluate_frame([det("person", NEAR_PERSON), det("no-helmet", NEAR_HEAD), det("helmet", NEAR_HELMET)], FRAME)
+    assert status(obs) == "PRESENT"
+
+
+def test_explicit_no_vest_is_not_ordinary_absence_evidence():
+    torso = (270., 180., 370., 310.)
+    obs = engine(["safety-vest"]).evaluate_frame([det("person", NEAR_PERSON), det("no-vest", torso, .8)], FRAME)
+    assert status(obs, "safety-vest") == "MISSING_POSITIVE"
+    assert "no-vest" in obs[0].items["safety-vest"].support
+
+
+def test_low_confidence_no_vest_does_not_fall_back_to_missing_absent():
+    torso = (270., 180., 370., 310.)
+    obs = engine(["safety-vest"]).evaluate_frame([det("person", NEAR_PERSON), det("no-vest", torso, .5)], FRAME)
+    assert status(obs, "safety-vest") == "UNKNOWN"
+
+
+def test_explicit_no_helmet_on_a_distant_person_is_unknown():
+    obs = engine().evaluate_frame([det("person", FAR_PERSON), det("no-helmet", FAR_HEAD)], FRAME)
+    assert status(obs) == "UNKNOWN"
+
+
+def test_candidate_person_without_helmet_or_negative_is_unknown():
+    obs = engine().evaluate_frame([det("person", NEAR_PERSON)], FRAME)
+    assert status(obs) == "UNKNOWN"
+
+
 if __name__ == "__main__":
     print("PPE rule engine tests\n")
     sys.exit(_run())

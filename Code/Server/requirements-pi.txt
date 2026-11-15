@@ -22,7 +22,7 @@
 # ultralytics also depends on opencv-python and numpy>=2, so installing it on
 # the Pi would break the camera.
 
-onnxruntime>=1.17,<2
+onnxruntime>=1.18,<2
 
 # Provided by apt, listed for the record:
 #   python3-opencv     (cv2)

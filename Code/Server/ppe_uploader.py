@@ -60,7 +60,7 @@ class Uploader(threading.Thread):
         self.poll_interval_s = poll_interval_s
         self.dry_run = dry_run
 
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._backoff = 0.0
         self.online: bool | None = None  # None until the first probe
         self.sent_count = 0
@@ -74,7 +74,7 @@ class Uploader(threading.Thread):
             print("[uploader] dry_run: snapshots stay on disk, nothing is uploaded")
             return
         print(f"[uploader] started, target {self.ingest_url}")
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 self._tick()
             except Exception as exc:  # never let the thread die
@@ -108,7 +108,7 @@ class Uploader(threading.Thread):
         self._backoff = 0.0
 
         for event in events:
-            if self._stop.is_set():
+            if self._stop_event.is_set():
                 return
             ok, permanent = self.post_event(event)
             if ok:
@@ -205,10 +205,10 @@ class Uploader(threading.Thread):
         return self._backoff
 
     def _sleep(self, seconds: float) -> None:
-        self._stop.wait(seconds)
+        self._stop_event.wait(seconds)
 
     def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
+        self._stop_event.set()
         if self.is_alive():
             self.join(timeout)
 

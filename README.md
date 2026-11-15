@@ -1,3 +1,8 @@
+> **Robot test branch: SafetyVision nano.** This branch uses SafetyVision for
+> PPE and SH17 for person detection, with both ONNX files included. Requires
+> ONNX Runtime 1.18+. See [Pi setup and test commands](docs/ROBOT_SAFETYVISION_TEST.md).
+> Earlier SH17-only descriptions below document the original architecture.
+
 # SafetyRobot
 
 An autonomous robot that patrols a facility, spots people not wearing required PPE, and

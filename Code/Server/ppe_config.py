@@ -51,11 +51,12 @@ class ModelConfig:
                   Deliberately low -- positive evidence should win easily.
     """
 
-    scan_onnx: str = "models/ppe_yolo8n_448.onnx"
-    confirm_onnx: str = "models/ppe_yolo8n_640.onnx"
+    scan_onnx: str = "models/ppe_safetyvision_nano_640.onnx"
+    confirm_onnx: str = "models/ppe_safetyvision_nano_640.onnx"
+    person_onnx: str | None = None  # optional separate person detector
     pt_path: str = "../../yolo8n.pt"
     backend: str = "onnx"  # "onnx" | "ultralytics" (PC validation only)
-    conf_default: float = 0.30
+    conf_default: float = 0.25
     iou_nms: float = 0.45
     intra_op_threads: int = 3  # leave a core for the camera encoder + drive loop
     class_conf: dict[str, float] = field(
@@ -63,7 +64,7 @@ class ModelConfig:
             "person": 0.45,
             "helmet": 0.40,
             "head": 0.50,
-            "safety-vest": 0.40,
+            "safety-vest": 0.25,
             "hands": 0.45,
             "gloves": 0.40,
             "foot": 0.45,
@@ -78,12 +79,13 @@ class ModelConfig:
             "foot": 0.55,
             "face": 0.55,
             "ear": 0.60,
+            **{name: 0.65 for name in ("no-helmet", "no-vest", "no-gloves", "no-glasses", "no-mask")},
         }
     )
     veto_conf: dict[str, float] = field(
         default_factory=lambda: {
             "helmet": 0.35,
-            "safety-vest": 0.35,
+            "safety-vest": 0.25,
             "safety-suit": 0.35,
             "medical-suit": 0.35,
             "gloves": 0.35,

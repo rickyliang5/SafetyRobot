@@ -32,6 +32,7 @@ Four details that are easy to get wrong and silently ruin everything:
 
 from __future__ import annotations
 
+import ast
 import time
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,8 @@ from typing import Any
 import cv2
 import numpy as np
 
-from ppe_classes import CLASS_NAMES, NUM_CLASSES
+from ppe_classes import (CLASS_NAMES, CLASS_IDS, NUM_CLASSES,
+                         SAFETYVISION_CLASS_NAMES, SAFETYVISION_CLASS_MAP)
 from ppe_types import Detection
 
 PAD_VALUE = 114  # ultralytics' letterbox grey; must match training
@@ -156,6 +158,8 @@ def decode_v8(
     iou_thr: float,
     class_conf: dict[str, float] | None = None,
     allowed: set[int] | None = None,
+    class_names: tuple[str, ...] = CLASS_NAMES,
+    class_map: dict[str, str | None] | None = None,
 ) -> list[Detection]:
     """Decode a YOLOv8 detection head into Detections.
 
@@ -163,21 +167,26 @@ def decode_v8(
     `conf_floor` admits candidates; `class_conf` then applies a per-class bar
     after NMS, so a tight per-class threshold never costs us NMS quality.
     """
+    nc = len(class_names)
     arr = raw[0] if raw.ndim == 3 else raw
-    if arr.shape[0] == 4 + NUM_CLASSES:
+    if arr.ndim != 2:
+        raise ValueError(f"unexpected model output {raw.shape}")
+    if arr.shape[0] == 4 + nc:
         arr = arr.T  # (N, 4+nc) -- channels-first is the usual export layout
-    elif arr.shape[1] != 4 + NUM_CLASSES:
+    elif arr.shape[1] != 4 + nc:
         raise ValueError(
-            f"unexpected model output {raw.shape}; expected a 4+{NUM_CLASSES} axis"
+            f"unexpected model output {raw.shape}; expected a 4+{nc} axis"
         )
 
     cls_scores = arr[:, 4:]
     cls_ids = cls_scores.argmax(axis=1)
     scores = cls_scores[np.arange(cls_scores.shape[0]), cls_ids]
 
-    mask = scores >= conf_floor
+    names = tuple((class_map or {}).get(name, name) for name in class_names)
+    canonical_ids = np.array([CLASS_IDS[name] if name is not None else -1 for name in names])
+    mask = (scores >= conf_floor) & (canonical_ids[cls_ids] >= 0)
     if allowed is not None:
-        mask &= np.isin(cls_ids, list(allowed))
+        mask &= np.isin(canonical_ids[cls_ids], list(allowed))
     if not mask.any():
         return []
 
@@ -196,7 +205,7 @@ def decode_v8(
     for cid in np.unique(cls_ids):
         sel = np.where(cls_ids == cid)[0]
         keep = nms_numpy(boxes[sel], scores[sel], iou_thr)
-        name = CLASS_NAMES[int(cid)]
+        name = names[int(cid)]
         bar = (class_conf or {}).get(name, 0.0)
         for k in keep:
             idx = sel[k]
@@ -207,7 +216,7 @@ def decode_v8(
             if x2 - x1 < 1.0 or y2 - y1 < 1.0:
                 continue
             out.append(
-                Detection(cls_id=int(cid), name=name, conf=score, xyxy=(x1, y1, x2, y2))
+                Detection(cls_id=CLASS_IDS[name], name=name, conf=score, xyxy=(x1, y1, x2, y2))
             )
 
     out.sort(key=lambda d: d.conf, reverse=True)
@@ -235,6 +244,7 @@ class PpeDetector:
         class_conf: dict[str, float] | None = None,
         intra_op_threads: int = 3,
         providers: list[str] | None = None,
+        person_onnx: str | Path | None = None,
     ) -> None:
         self.onnx_path = Path(onnx_path)
         if not self.onnx_path.is_file():
@@ -277,35 +287,42 @@ class PpeDetector:
         self.output_names = [o.name for o in self.session.get_outputs()]
 
         self._verify_class_vocabulary()
+        self.person_detector = (
+            PpeDetector(person_onnx, conf=conf, iou=iou, class_conf=class_conf,
+                        intra_op_threads=intra_op_threads, providers=providers)
+            if person_onnx is not None else None
+        )
 
     def _verify_class_vocabulary(self) -> None:
-        """Check the model's embedded class names against ours.
-
-        A model swap that silently shifts label indices would turn every
-        verdict into nonsense while looking perfectly healthy, so this is
-        worth the few lines. Only warns when metadata is absent, since ONNX
-        exports don't always carry it.
-        """
+        """Accept only the exact known vocabularies, then map to internal labels."""
+        self.class_names = CLASS_NAMES
+        self.class_map = None
         meta = self.session.get_modelmeta().custom_metadata_map or {}
         raw = meta.get("names")
         if not raw:
-            print(
-                f"[detector] note: {self.onnx_path.name} carries no class metadata; "
-                f"assuming the {NUM_CLASSES}-class SH17 vocabulary"
-            )
+            print(f"[detector] no class metadata; assuming {NUM_CLASSES}-class SH17")
             return
         try:
-            parsed: Any = eval(raw, {"__builtins__": {}}, {})  # noqa: S307
-        except Exception:  # pragma: no cover
+            parsed = ast.literal_eval(raw)
+            if isinstance(parsed, dict):
+                indexed = {int(k): value for k, value in parsed.items()}
+                if set(indexed) != set(range(len(indexed))):
+                    raise ValueError("class metadata IDs must be contiguous from zero")
+                got = tuple(indexed[i] for i in range(len(indexed)))
+            elif isinstance(parsed, (list, tuple)):
+                got = tuple(parsed)
+            else:
+                raise ValueError("class names must be a mapping or sequence")
+        except (ValueError, SyntaxError, TypeError) as exc:
+            raise ValueError("invalid model class metadata; refusing to guess") from exc
+        if got == CLASS_NAMES:
             return
-        if isinstance(parsed, dict):
-            got = tuple(parsed[k] for k in sorted(parsed, key=int))
-            if got != CLASS_NAMES:
-                raise ValueError(
-                    "model class names do not match ppe_classes.CLASS_NAMES.\n"
-                    f"  model: {got}\n  ours : {CLASS_NAMES}\n"
-                    "Refusing to run: every PPE verdict would be mislabelled."
-                )
+        if got == SAFETYVISION_CLASS_NAMES:
+            self.class_names = got
+            self.class_map = SAFETYVISION_CLASS_MAP
+            print("[detector] SafetyVision nano: explicit PPE class adapter active")
+            return
+        raise ValueError(f"unsupported model class names: {got}; refusing to mislabel detections")
 
     @classmethod
     def from_config(cls, cfg, which: str = "confirm") -> PpeDetector:
@@ -318,6 +335,7 @@ class PpeDetector:
             iou=model.iou_nms,
             class_conf=model.class_conf,
             intra_op_threads=model.intra_op_threads,
+            person_onnx=cfg.resolve_path(model.person_onnx) if model.person_onnx else None,
         )
 
     # ------------------------------------------------------------------ infer
@@ -334,7 +352,7 @@ class PpeDetector:
         h, w = frame_bgr.shape[:2]
         blob, ratio, pad = preprocess(frame_bgr, self.input_size)
         raw = self.session.run(self.output_names, {self.input_name: blob})[0]
-        return decode_v8(
+        detections = decode_v8(
             raw,
             ratio,
             pad,
@@ -343,7 +361,19 @@ class PpeDetector:
             iou_thr=self.iou,
             class_conf=self.class_conf if apply_class_conf else None,
             allowed=allowed,
+            class_names=self.class_names,
+            class_map=self.class_map,
         )
+        if self.person_detector is not None:
+            # This candidate's Person class is weak. Use SH17 people as owners
+            # while retaining only candidate PPE/missing-PPE detections.
+            detections = [d for d in detections if d.name != "person"]
+            if allowed is None or CLASS_IDS["person"] in allowed:
+                detections.extend(self.person_detector.detect(
+                    frame_bgr, allowed={CLASS_IDS["person"]},
+                    apply_class_conf=apply_class_conf))
+            detections.sort(key=lambda d: d.conf, reverse=True)
+        return detections
 
     def detect_crop(
         self,
@@ -413,6 +443,8 @@ class PpeDetector:
         }
 
     def close(self) -> None:
+        if self.person_detector is not None:
+            self.person_detector.close()
         self.session = None
 
 
@@ -422,6 +454,7 @@ class PpeDetector:
 
 _COLOURS = {
     "person": (255, 190, 80),
+    **{name: (70, 90, 255) for name in ("no-helmet", "no-vest", "no-gloves", "no-glasses", "no-mask")},
     "helmet": (80, 220, 110),
     "head": (70, 90, 255),
     "safety-vest": (80, 220, 110),
@@ -517,6 +550,7 @@ def _main() -> int:
         iou=cfg.model.iou_nms,
         class_conf=cfg.model.class_conf,
         intra_op_threads=args.threads or cfg.model.intra_op_threads,
+        person_onnx=cfg.resolve_path(cfg.model.person_onnx) if cfg.model.person_onnx else None,
     )
     print(f"model {det.onnx_path.name}  input {det.input_size}")
 

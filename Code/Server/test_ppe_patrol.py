@@ -432,6 +432,19 @@ def _run() -> int:
     return 1 if failures else 0
 
 
+
+def test_drive_thread_stops_and_joins_without_shadowing_thread_internals():
+    drive, car, shared, cfg = build(distances=[250.])
+    drive.start()
+    try:
+        drive.stop(timeout=2.)
+        assert not drive.is_alive()
+        assert car.motor == (0, 0, 0, 0)
+    finally:
+        if drive.is_alive():
+            drive.stop(timeout=2.)
+
+
 if __name__ == "__main__":
     print("PPE patrol state machine tests\n")
     sys.exit(_run())

@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ppe_classes import PPE_ITEMS, PERSON
+from ppe_classes import PPE_ITEMS, PPE_VIOLATIONS, PERSON
 from ppe_config import ModelConfig, RulesConfig
 from ppe_types import (
     Detection,
@@ -226,8 +226,9 @@ class RuleEngine:
     def _assess_item(self, obs: PersonObservation, item: str) -> ItemEvidence:
         satisfied_by, proven_missing_by = PPE_ITEMS[item]
 
+        explicit_names = PPE_VIOLATIONS.get(item, ())
         ambiguous = obs.attached.get("__ambiguous__", [])
-        if any(a.name in satisfied_by or a.name in proven_missing_by for a in ambiguous):
+        if any(a.name in satisfied_by or a.name in proven_missing_by or a.name in explicit_names for a in ambiguous):
             return ItemEvidence(
                 "UNKNOWN",
                 {},
@@ -275,6 +276,22 @@ class RuleEngine:
                 "PRESENT",
                 {worn.name: worn.conf},
                 f"{worn.name} detected at {worn.conf:.2f}",
+            )
+
+        # Explicit NO-* predictions are model classifications, not bare body
+        # parts. Never translate their potentially person-sized boxes to heads.
+        explicit = self._best(obs, explicit_names)
+        if explicit is not None:
+            threshold = self.model.evidence_threshold(explicit.name)
+            if explicit.conf < threshold or not obs.view_ok:
+                return ItemEvidence(
+                    "UNKNOWN", {explicit.name: explicit.conf},
+                    f"{explicit.name} below evidence bar or person not fully visible",
+                )
+            return ItemEvidence(
+                "MISSING_POSITIVE",
+                {explicit.name: explicit.conf, PERSON: obs.person.conf},
+                f"model classified {explicit.name} at {explicit.conf:.2f}; no associated PPE presence",
             )
 
         # (3) A body part we can see but not confidently enough to accuse on.

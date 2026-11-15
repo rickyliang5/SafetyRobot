@@ -36,6 +36,30 @@ NUM_CLASSES = len(CLASS_NAMES)
 
 CLASS_IDS: dict[str, int] = {name: i for i, name in enumerate(CLASS_NAMES)}
 
+# Internal labels for explicit model predictions. These are NOT SH17 output
+# channels: keep CLASS_NAMES/NUM_CLASSES unchanged for the original model.
+PPE_VIOLATIONS = {
+    "helmet": ("no-helmet",), "safety-vest": ("no-vest",),
+    "gloves": ("no-gloves",), "eye-protection": ("no-glasses",),
+    "face-mask": ("no-mask",),
+}
+for _names in PPE_VIOLATIONS.values():
+    for _name in _names:
+        CLASS_IDS[_name] = len(CLASS_IDS)
+
+SAFETYVISION_CLASS_NAMES = (
+    "Fall-Detected", "Gloves", "Goggles", "Hardhat", "Mask", "NO-Gloves",
+    "NO-Goggles", "NO-Hardhat", "NO-Mask", "NO-Safety Vest", "No_Harness",
+    "Person", "Safety Vest",
+)
+SAFETYVISION_CLASS_MAP = {
+    "Fall-Detected": None, "Gloves": "gloves", "Goggles": "glasses",
+    "Hardhat": "helmet", "Mask": "face-mask", "NO-Gloves": "no-gloves",
+    "NO-Goggles": "no-glasses", "NO-Hardhat": "no-helmet",
+    "NO-Mask": "no-mask", "NO-Safety Vest": "no-vest", "No_Harness": None,
+    "Person": "person", "Safety Vest": "safety-vest",
+}
+
 PERSON = "person"
 
 # The model has no "no-helmet" class. Violations are inferred from the geometry

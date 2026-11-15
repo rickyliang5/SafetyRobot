@@ -2,34 +2,33 @@
   "robot_id": "freenove-01",
   "zone_label": "workshop",
   "dry_run": false,
-
   "model": {
-    "scan_onnx": "models/ppe_yolo8n_448.onnx",
-    "confirm_onnx": "models/ppe_yolo8n_640.onnx",
+    "scan_onnx": "models/ppe_safetyvision_nano_640.onnx",
+    "confirm_onnx": "models/ppe_safetyvision_nano_640.onnx",
     "pt_path": "../../yolo8n.pt",
     "backend": "onnx",
-    "conf_default": 0.30,
+    "conf_default": 0.25,
     "iou_nms": 0.45,
-    "intra_op_threads": 3
+    "intra_op_threads": 3,
+    "person_onnx": "models/ppe_yolo8n_640.onnx"
   },
-
   "rules": {
-    "required_ppe": ["helmet"]
+    "required_ppe": [
+      "helmet",
+      "safety-vest"
+    ]
   },
-
   "temporal": {
     "window_m": 10,
     "positive_n": 5,
     "absence_n": 8,
     "min_track_hits": 4
   },
-
   "cooldown": {
     "per_person_s": 90.0,
     "global_min_interval_s": 8.0,
     "max_per_hour": 60
   },
-
   "patrol": {
     "cruise_duty": 700,
     "stop_distance_cm": 35.0,
@@ -38,17 +37,17 @@
     "pan_right": 120,
     "hold_max_s": 8.0
   },
-
   "camera": {
-    "stream_size": [640, 480],
+    "stream_size": [
+      640,
+      480
+    ],
     "mjpeg_port": 8080
   },
-
   "snapshots": {
     "dir": "snapshots",
     "jpeg_quality": 85
   },
-
   "portal": {
     "url": "http://127.0.0.1:5050",
     "api_key": "change-me"

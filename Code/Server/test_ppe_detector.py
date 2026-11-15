@@ -351,6 +351,88 @@ def _run() -> int:
     return 1 if failures else 0
 
 
+
+def _safetyvision_decode(source_id, allowed=None):
+    from ppe_classes import SAFETYVISION_CLASS_NAMES, SAFETYVISION_CLASS_MAP
+    raw = np.zeros((1, 4 + len(SAFETYVISION_CLASS_NAMES), 1), dtype=np.float32)
+    raw[0, :4, 0] = [320, 240, 100, 200]
+    raw[0, 4 + source_id, 0] = .9
+    return decode_v8(raw, 1., (0., 0.), (640, 480), .25, .45,
+                     allowed=allowed, class_names=SAFETYVISION_CLASS_NAMES,
+                     class_map=SAFETYVISION_CLASS_MAP)
+
+
+def test_safetyvision_person_and_helmet_map_to_canonical_ids():
+    for source, name in [(11, "person"), (3, "helmet"), (12, "safety-vest")]:
+        dets = _safetyvision_decode(source)
+        assert len(dets) == 1 and dets[0].name == name
+        assert dets[0].cls_id == CLASS_IDS[name]
+
+
+def test_safetyvision_no_helmet_is_not_a_bare_head():
+    dets = _safetyvision_decode(7)
+    assert len(dets) == 1 and dets[0].name == "no-helmet"
+    assert dets[0].cls_id != CLASS_IDS["head"]
+
+
+def test_safetyvision_unsupported_fall_and_harness_are_ignored():
+    assert _safetyvision_decode(0) == []
+    assert _safetyvision_decode(10) == []
+
+
+def test_safetyvision_allowed_filter_uses_canonical_ids():
+    assert len(_safetyvision_decode(3, {CLASS_IDS["helmet"]})) == 1
+    assert _safetyvision_decode(3, {CLASS_IDS["person"]}) == []
+
+
+def test_model_vocabulary_fails_closed_for_unrecognized_or_malformed_names():
+    from types import SimpleNamespace
+    from ppe_detector import PpeDetector
+    for names in ("{0: 'person', 1: 'vest'}", "not a literal", "{1: 'person'}"):
+        detector = PpeDetector.__new__(PpeDetector)
+        detector.session = SimpleNamespace(get_modelmeta=lambda: SimpleNamespace(custom_metadata_map={"names": names}))
+        try:
+            detector._verify_class_vocabulary()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("must reject unrecognized class metadata")
+
+
+
+def test_separate_person_model_replaces_candidate_person_boxes():
+    from types import SimpleNamespace
+    from ppe_classes import SAFETYVISION_CLASS_NAMES, SAFETYVISION_CLASS_MAP
+    from ppe_detector import PpeDetector
+    from ppe_types import Detection
+    raw = np.zeros((1, 4 + len(SAFETYVISION_CLASS_NAMES), 2), dtype=np.float32)
+    raw[0, :4, :] = np.array([[320, 320], [240, 120], [100, 50], [200, 50]])
+    raw[0, 4 + 11, 0] = .9  # candidate person (must be replaced)
+    raw[0, 4 + 3, 1] = .9   # candidate helmet (must survive)
+    detector = PpeDetector.__new__(PpeDetector)
+    detector.input_size = (640, 640)
+    detector.input_name = "images"
+    detector.output_names = ["output0"]
+    detector.class_names = SAFETYVISION_CLASS_NAMES
+    detector.class_map = SAFETYVISION_CLASS_MAP
+    detector.conf, detector.iou, detector.class_conf = .25, .45, {}
+    detector.session = SimpleNamespace(run=lambda *a: [raw])
+    reference_person = Detection(CLASS_IDS["person"], "person", .8, (200., 50., 440., 450.))
+    calls = []
+    def people(frame, **kwargs):
+        calls.append(kwargs)
+        return [reference_person]
+    detector.person_detector = SimpleNamespace(detect=people)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    dets = detector.detect(frame)
+    assert [d for d in dets if d.name == "person"] == [reference_person]
+    assert any(d.name == "helmet" for d in dets)
+    assert calls[0]["allowed"] == {CLASS_IDS["person"]}
+    calls.clear()
+    dets = detector.detect(frame, allowed={CLASS_IDS["helmet"]})
+    assert len(dets) == 1 and dets[0].name == "helmet" and not calls
+
+
 if __name__ == "__main__":
     print("PPE detector pre/post-processing tests\n")
     sys.exit(_run())
