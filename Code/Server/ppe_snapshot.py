@@ -311,7 +311,9 @@ def build_payload(
         "clock_synced": clock_is_synced(),
         "monotonic_s": round(time.monotonic(), 3),
         "required_ppe": list(cfg.rules.required_ppe),
+        "optional_ppe": list(cfg.rules.optional_ppe),
         "missing_ppe": list(event.items),
+        "status": event.status,
         "track_id": event.track_id,
         "person_conf": round(float(observation.person.conf), 4),
         "person_bbox": [round(float(v), 1) for v in observation.person.xyxy],
@@ -321,8 +323,7 @@ def build_payload(
                 **observation.items[item].to_json(),
                 "frames_agree": event.frames_agree.get(item),
             }
-            for item in event.items
-            if item in observation.items
+            for item in observation.items
         },
         "detections": [
             d.to_json()

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from ppe_classes import validate_class_name, validate_item_name
+from ppe_classes import PPE_ITEMS, validate_class_name, validate_item_name
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = HERE / "ppe_config.json"
@@ -153,6 +153,7 @@ class RulesConfig:
             "uncertain-vest": (0.15, 0.75),
             "gloves": (0.20, 0.90),
             "hands": (0.20, 0.90),
+            "glasses": (0.00, 0.40),
             "shoes": (0.70, 1.00),
             "foot": (0.70, 1.00),
         }
@@ -161,10 +162,18 @@ class RulesConfig:
     min_person_area_frac: float = 0.02
     edge_margin_px: int = 8
     absence_requires_full_view: bool = True
+    optional_ppe: list[str] = field(default_factory=list)
+    accepted_ppe: dict[str, list[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for item in self.required_ppe:
+        for item in (*self.required_ppe, *self.optional_ppe):
             validate_item_name(item)
+        if set(self.required_ppe) & set(self.optional_ppe):
+            raise ValueError("required_ppe and optional_ppe must contain different items")
+        for item, names in self.accepted_ppe.items():
+            allowed, _ = PPE_ITEMS[validate_item_name(item)]
+            if not names or any(name not in allowed for name in names):
+                raise ValueError(f"accepted_ppe[{item!r}] must select from {allowed}")
         for name, band in self.region_gates.items():
             validate_class_name(name)
             lo, hi = band
@@ -291,6 +300,7 @@ class CameraConfig:
     buffer_count: int = 4
     mjpeg_port: int = 8080
     mjpeg_quality: int = 70
+    sensor_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -394,7 +404,7 @@ def _build_section(cls: type, raw: dict[str, Any], section: str):
     for f in fields(cls):
         if f.name not in kwargs:
             continue
-        if f.name == "stream_size" and isinstance(kwargs[f.name], list):
+        if f.name in ("stream_size", "sensor_size") and isinstance(kwargs[f.name], list):
             kwargs[f.name] = tuple(kwargs[f.name])
         if f.name == "region_gates" and isinstance(kwargs[f.name], dict):
             kwargs[f.name] = {k: tuple(v) for k, v in kwargs[f.name].items()}

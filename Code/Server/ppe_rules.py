@@ -79,9 +79,14 @@ class PersonObservation:
     view_ok: bool = False
     truncated: bool = False
     height_frac: float = 0.0
+    optional_ppe: tuple[str, ...] = ()
+
+    @property
+    def required_items(self) -> tuple[str, ...]:
+        return tuple(item for item in self.items if item not in self.optional_ppe)
 
     def missing_items(self) -> list[str]:
-        return [name for name, ev in self.items.items() if ev.is_missing]
+        return [item for item in self.required_items if self.items[item].is_missing]
 
     def to_json(self) -> dict:
         return {
@@ -124,7 +129,7 @@ class RuleEngine:
         self._associate(observations, others, frame_shape)
 
         for obs in observations:
-            for item in self.rules.required_ppe:
+            for item in (*self.rules.required_ppe, *self.rules.optional_ppe):
                 obs.items[item] = self._assess_item(obs, item)
         return observations
 
@@ -151,6 +156,7 @@ class RuleEngine:
             view_ok=view_ok,
             truncated=truncated,
             height_frac=height_frac,
+            optional_ppe=tuple(self.rules.optional_ppe),
         )
 
     def _associate(
@@ -225,6 +231,7 @@ class RuleEngine:
 
     def _assess_item(self, obs: PersonObservation, item: str) -> ItemEvidence:
         satisfied_by, proven_missing_by = PPE_ITEMS[item]
+        satisfied_by = self.rules.accepted_ppe.get(item, satisfied_by)
 
         explicit_names = PPE_VIOLATIONS.get(item, ())
         ambiguous = obs.attached.get("__ambiguous__", [])
@@ -339,7 +346,7 @@ class RuleEngine:
         self,
         obs: PersonObservation,
         bare: Detection,
-        satisfied_by: tuple[str, ...],
+        satisfied_by: tuple[str, ...] | list[str],
     ) -> Detection | None:
         """A PPE box overlapping the bare part enough to count as covering it.
 
@@ -350,6 +357,11 @@ class RuleEngine:
         """
         for name in satisfied_by:
             for ppe in obs.attached.get(name, []):
+                if name == "glasses" and bare.name == "face":
+                    top, bottom = vertical_band(ppe.xyxy, bare.xyxy)
+                    if (top + bottom) / 2 <= 0.60 and overlap_frac(ppe.xyxy, bare.xyxy) >= 0.50:
+                        return ppe
+                    continue
                 if overlap_frac(bare.xyxy, ppe.xyxy) > self.rules.ppe_cover_overlap_min:
                     return ppe
         return None

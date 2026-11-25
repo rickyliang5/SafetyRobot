@@ -32,12 +32,12 @@ camera_steady / hold_granted handshake.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable
 
 from ppe_classes import is_positive_evidence_item
 from ppe_config import CooldownConfig, TemporalConfig
-from ppe_rules import ItemStatus, PersonObservation
+from ppe_rules import ItemEvidence, ItemStatus, PersonObservation
 from ppe_types import Box, iou
 
 # Set by ppe_patrol when a real frame is available; kept optional so the whole
@@ -60,11 +60,13 @@ class ViolationEvent:
     observation: PersonObservation
     frames_agree: dict[str, str]  # item -> "6/10"
     confirmed_at: float
+    status: str = "non_compliant"
 
     def to_json(self) -> dict:
         return {
             "track_id": self.track_id,
             "missing_ppe": list(self.items),
+            "status": self.status,
             "frames_agree": dict(self.frames_agree),
             **self.observation.to_json(),
         }
@@ -97,6 +99,10 @@ class Track:
     signature: object | None = None
     last_present: dict[str, float] = field(default_factory=dict)
     presence_hold_s: float = 0.0
+    optional_ppe: tuple[str, ...] = ()
+    last_case: tuple[str, ...] | None = None
+    last_case_at: float = float("-inf")
+    optional_case: dict[str, str] = field(default_factory=dict)
 
     def suppressed(self, item: str, now: float) -> bool:
         return now < self.item_cooldown.get(item, float("-inf"))
@@ -218,6 +224,7 @@ class PersonTracker:
             if now - track.last_seen > self.presence_hold_s:
                 track.last_present.clear()
             track.presence_hold_s = self.presence_hold_s
+            track.optional_ppe = obs.optional_ppe
             track.box = obs.person.xyxy
             track.hits += 1
             track.misses = 0
@@ -367,7 +374,10 @@ class ViolationConfirmer:
 
     def feed(self, track: Track, now: float) -> ViolationEvent | None:
         """Emit an event if this track has newly confirmed a violation."""
-        confirmed = self.confirmed_items(track)
+        confirmed = {
+            item: agree for item, agree in self.confirmed_items(track).items()
+            if item not in track.optional_ppe
+        }
         if not confirmed:
             return None
 
@@ -393,6 +403,52 @@ class ViolationConfirmer:
             observation=obs,
             frames_agree=fresh,
             confirmed_at=now,
+        )
+
+    def feed_case(
+        self, track: Track, obs: PersonObservation, now: float,
+    ) -> ViolationEvent | None:
+        """Report a stable PPE combination from the stationary inspection."""
+        missing_evidence = {
+            item: agree for item, agree in self.confirmed_items(track).items()
+            if item in obs.items and obs.items[item].is_missing
+        }
+        missing = {item: agree for item, agree in missing_evidence.items()
+                   if item in obs.required_items}
+        present = {}
+        for item, evidence in obs.items.items():
+            positive, absent, worn, total = track.counts(item)
+            if evidence.status == "PRESENT" and not (positive or absent) and worn >= self.temporal.absence_n:
+                present[item] = f"{worn}/{total}"
+        if not missing and (not obs.required_items or any(item not in present for item in obs.required_items)):
+            return None
+        # Occlusion alone should not make a previously missing item look
+        # resolved. Wait for positive evidence before reporting that change.
+        if track.last_case and any(item not in missing and item not in present for item in track.last_case):
+            return None
+        case = tuple(sorted(missing))
+        optional_case = track.optional_case.copy()
+        for item in obs.optional_ppe:
+            if item in missing_evidence:
+                optional_case[item] = "missing"
+            elif item in present:
+                optional_case[item] = "present"
+        if (case == track.last_case and optional_case == track.optional_case
+                and now - track.last_case_at < self.cooldown.per_person_s):
+            return None
+        track.last_case = case
+        track.last_case_at = now
+        track.optional_case = optional_case
+        agreement = {**missing_evidence, **present}
+        evidence = {
+            item: decision if item in agreement else ItemEvidence("UNKNOWN")
+            for item, decision in obs.items.items()
+        }
+        return ViolationEvent(
+            track_id=track.track_id, items=list(case),
+            observation=replace(obs, items=evidence),
+            frames_agree=agreement, confirmed_at=now,
+            status="non_compliant" if missing else "compliant",
         )
 
     # --------------------------------------------------------------- helpers
@@ -467,16 +523,18 @@ class PatrolVisionState:
         now: float,
         frame_bgr=None,
         record: bool = True,
+        report_cases: bool = False,
     ) -> list[ViolationEvent]:
         pairs = self.tracker.update(observations, now, frame_bgr, record=record)
         events: list[ViolationEvent] = []
-        for track, _obs in pairs:
+        for track, obs in pairs:
             if track.track_id not in self._known:
                 self._known.add(track.track_id)
                 self.confirmer.adopt_history(track, now)
             if not record:
                 continue
-            event = self.confirmer.feed(track, now)
+            event = (self.confirmer.feed_case(track, obs, now) if report_cases
+                     else self.confirmer.feed(track, now))
             if event is not None:
                 events.append(event)
         self._known &= set(self.tracker.tracks)

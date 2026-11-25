@@ -9,7 +9,8 @@ for a *new* frame -- so it blocks forever if streaming was never started
 Instead the patrol configures picamera2 itself with no encoder at all and
 pulls BGR arrays straight from the ISP:
 
-  * 640x480 `main` stream in XBGR8888, one `capture_array` per inference.
+  * 640x480 `main` stream in Picamera2's RGB888 format, which delivers BGR
+    arrays for OpenCV. One `capture_array` per inference.
   * 640x480 letterboxes into the model's 640x640 with padding ONLY and zero
     downscaling. The model was trained at imgsz=640, so this is the cheapest
     accuracy in the whole project. Upstream's 400x300 stream (main.py:46)
@@ -51,12 +52,14 @@ class PiCamera:
         vflip: bool = False,
         buffer_count: int = 4,
         max_fps: int = 30,
+        sensor_size: tuple[int, int] | None = None,
     ) -> None:
         self._size = (int(size[0]), int(size[1]))
         self.hflip = hflip
         self.vflip = vflip
         self.buffer_count = buffer_count
         self.max_fps = max_fps
+        self.sensor_size = sensor_size
         self.camera = None
         self._started = False
 
@@ -71,11 +74,12 @@ class PiCamera:
         from picamera2 import Picamera2
 
         self.camera = Picamera2()
-        # XBGR8888 gives a 4-channel array we drop the alpha from -- one
-        # cvtColor, no colour-space guessing. A `lores` stream would be forced
-        # to YUV420 and need a heavier conversion for no benefit here.
+        # Picamera2 RGB888 delivers bytes in OpenCV's BGR order.
         config = self.camera.create_video_configuration(
-            main={"size": self._size, "format": "XBGR8888"},
+            main={"size": self._size, "format": "RGB888"},
+            # Sensor mode sets the field of view independently of the
+            # downscaled stream sent to inference.
+            sensor={"output_size": self.sensor_size} if self.sensor_size else {},
             transform=Transform(
                 hflip=1 if self.hflip else 0, vflip=1 if self.vflip else 0
             ),
@@ -94,14 +98,7 @@ class PiCamera:
         if not self._started:
             return None
         try:
-            import cv2
-
-            arr = self.camera.capture_array("main")
-            if arr is None:
-                return None
-            if arr.ndim == 3 and arr.shape[2] == 4:
-                return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-            return arr
+            return self.camera.capture_array("main")
         except Exception as exc:
             print(f"[camera] capture failed: {exc}")
             return None
@@ -231,16 +228,17 @@ def open_camera(cfg, source: str = "auto", index: int = 0, path: str | None = No
         return FileCamera(path, size)
     if source == "webcam":
         return WebcamCamera(size, index)
-    if source == "picamera":
-        return PiCamera(size, cfg.camera.hflip, cfg.camera.vflip, cfg.camera.buffer_count)
+    if source != "picamera":
+        try:
+            import picamera2  # noqa: F401
+        except ImportError:
+            print("[camera] picamera2 unavailable; falling back to a webcam")
+            return WebcamCamera(size, index)
 
-    try:
-        import picamera2  # noqa: F401
-
-        return PiCamera(size, cfg.camera.hflip, cfg.camera.vflip, cfg.camera.buffer_count)
-    except ImportError:
-        print("[camera] picamera2 unavailable; falling back to a webcam")
-        return WebcamCamera(size, index)
+    return PiCamera(
+        size, cfg.camera.hflip, cfg.camera.vflip, cfg.camera.buffer_count,
+        sensor_size=cfg.camera.sensor_size,
+    )
 
 
 if __name__ == "__main__":

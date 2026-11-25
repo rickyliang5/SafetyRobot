@@ -645,6 +645,7 @@ class PatrolVision(threading.Thread):
         store=None,
         frame_buffer=None,
         verbose: bool = False,
+        continuous_inspection: bool = False,
     ) -> None:
         super().__init__(name="ppe-vision", daemon=True)
         self.camera = camera
@@ -653,6 +654,9 @@ class PatrolVision(threading.Thread):
         self.store = store
         self.frame_buffer = frame_buffer
         self.verbose = verbose
+        self.continuous_inspection = continuous_inspection
+        self._inspection_lock = threading.Lock()
+        self._inspection_reset_at = float("-inf")
         self._stop_event = threading.Event()
         self.detector = None
         self.engine = None
@@ -673,7 +677,8 @@ class PatrolVision(threading.Thread):
         self.detector = PpeDetector.from_config(self.cfg, which="confirm")
         self.detector.warmup(2)
         self.engine = RuleEngine(self.cfg.rules, self.cfg.model)
-        self.vision_state = PatrolVisionState(self.cfg.temporal, self.cfg.cooldown)
+        with self._inspection_lock:
+            self.vision_state = PatrolVisionState(self.cfg.temporal, self.cfg.cooldown)
         print(
             f"[vision] detector {self.detector.onnx_path.name} "
             f"input {self.detector.input_size}, requiring "
@@ -699,6 +704,7 @@ class PatrolVision(threading.Thread):
 
         while not self._stop_event.is_set():
             loop_start = time.perf_counter()
+            captured_at = time.monotonic()
             frame = self.camera.capture_bgr()
             if frame is None:
                 self._stop_event.wait(0.1)
@@ -717,20 +723,22 @@ class PatrolVision(threading.Thread):
             observations = self.engine.evaluate_frame(detections, (width, height))
             self._update_person_telemetry(observations, height, infer_ms)
 
-            # Only frames captured while stopped and settled count toward
-            # N-of-M. Everything else maintains identity but adds no evidence.
-            recording = self.shared.may_record()
-            events = self.vision_state.process(
-                observations, now=time.monotonic(),
-                frame_bgr=frame, record=recording,
-            )
+            recording = self.continuous_inspection or self.shared.may_record()
+            with self._inspection_lock:
+                # A frame already in flight when Reset was pressed belongs to
+                # the previous inspection.
+                if captured_at < self._inspection_reset_at:
+                    continue
+                events = self.vision_state.process(
+                    observations, now=time.monotonic(), frame_bgr=frame, record=recording,
+                    report_cases=self.continuous_inspection,
+                )
+                for event in events:
+                    self._handle_violation(event, frame, (width, height))
             with self.shared.lock:
                 self.shared.frames_total += 1
                 if recording:
                     self.shared.frames_recorded += 1
-
-            for event in events:
-                self._handle_violation(event, frame, (width, height))
 
             if self.frame_buffer is not None and self.frame_buffer.has_viewers:
                 self._publish(frame, detections, observations, annotate, encode_jpeg)
@@ -761,13 +769,23 @@ class PatrolVision(threading.Thread):
         # thread decides whether and when to grant it.
         self.shared.ask_hold(bool(candidates))
 
+    def reset_inspection(self) -> float | None:
+        with self._inspection_lock:
+            if self.vision_state is None:
+                return None
+            self.vision_state.reset()
+            self._inspection_reset_at = time.monotonic()
+            reset_at = time.time()
+        print("[inspection] Reset votes and cooldowns; continuous capture running")
+        return reset_at
+
     def _handle_violation(self, event, frame, frame_shape) -> None:
         from ppe_snapshot import build_payload
 
         # Snapshot the clearest confirming frame the tracker cached, not
         # whichever frame happened to tip the counter over.
         track = self.vision_state.tracker.tracks.get(event.track_id)
-        best = getattr(track, "best_frame", None) if track else None
+        best = track.best_frame if track and not self.continuous_inspection else None
         evidence_frame = best if best is not None else frame
 
         state = self.shared.snapshot()
@@ -783,7 +801,10 @@ class PatrolVision(threading.Thread):
 
         items = ", ".join(event.items)
         agree = ", ".join(f"{k} {v}" for k, v in event.frames_agree.items())
-        print(f"[vision] VIOLATION track {event.track_id}: no {items} ({agree})")
+        if event.items:
+            print(f"[vision] VIOLATION track {event.track_id}: no {items} ({agree})")
+        else:
+            print(f"[vision] COMPLIANT track {event.track_id}: {agree}")
 
         if self.store is not None:
             try:
@@ -792,16 +813,18 @@ class PatrolVision(threading.Thread):
             except Exception as exc:
                 print(f"[vision] could not write snapshot: {exc}")
 
-        with self.shared.lock:
-            self.shared.violations_total += 1
-            self.shared.last_violation_at = time.time()
-        self.shared.ask_alert()
+        if event.items:
+            with self.shared.lock:
+                self.shared.violations_total += 1
+                self.shared.last_violation_at = time.time()
+            self.shared.ask_alert()
 
     def _publish(self, frame, detections, observations, annotate, encode_jpeg) -> None:
         try:
             drawn = annotate(frame, detections, observations)
             state = self.shared.snapshot()
-            self._draw_hud(drawn, state)
+            if not self.continuous_inspection:
+                self._draw_hud(drawn[:frame.shape[0]], state)
             jpeg = encode_jpeg(drawn, self.cfg.camera.mjpeg_quality)
             if jpeg:
                 self.frame_buffer.publish(jpeg)

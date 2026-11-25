@@ -17,8 +17,14 @@
   "rules": {
     "required_ppe": [
       "helmet",
+      "eye-protection",
       "safety-vest"
-    ]
+    ],
+    "optional_ppe": ["gloves"],
+    "accepted_ppe": {
+      "eye-protection": ["glasses"],
+      "safety-vest": ["safety-vest"]
+    }
   },
   "temporal": {
     "window_m": 10,

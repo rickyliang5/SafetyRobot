@@ -411,6 +411,66 @@ def _run() -> int:
     return 1 if failures else 0
 
 
+def test_continuous_inspection_reports_distinct_ppe_cases():
+    vision = state()
+    required = ["helmet", "safety-vest"]
+    vest = det("safety-vest", (275.0, 175.0, 360.0, 310.0))
+    events = []
+    for block, detections in enumerate((
+        helmeted_frame() + [vest],
+        bare_head_frame() + [vest],
+        bare_head_frame(),
+        helmeted_frame(),
+        helmeted_frame() + [vest],
+    )):
+        for i in range(20):
+            events.extend(vision.process(
+                observe(detections, required),
+                now=(block * 20 + i) * 0.5,
+                report_cases=True,
+            ))
+    assert [(event.status, event.items) for event in events] == [
+        ("compliant", []),
+        ("non_compliant", ["helmet"]),
+        ("non_compliant", ["helmet", "safety-vest"]),
+        ("non_compliant", ["safety-vest"]),
+        ("compliant", []),
+    ]
+    assert events[0].frames_agree == {"helmet": "8/8", "safety-vest": "8/8"}
+    assert events[1].observation.items["safety-vest"].status == "PRESENT"
+
+
+def test_ppe_ok_requires_glasses_vest_and_hard_hat_but_gloves_are_optional():
+    from ppe_config import load_config
+    from ppe_detector import _inspection_labels
+
+    cfg = load_config()
+    rules = RuleEngine(cfg.rules, cfg.model)
+    face = det("face", (301.0, 120.0, 340.0, 166.0))
+    glasses = det("glasses", (299.0, 128.0, 342.0, 140.0))
+    bare_hand = det("hands", (272.0, 245.0, 299.0, 280.0))
+    vest = det("safety-vest", (275.0, 175.0, 360.0, 310.0))
+    all_required = helmeted_frame() + [face, glasses, vest, bare_hand]
+
+    for missing in ("helmet", "glasses", "safety-vest"):
+        observations = rules.evaluate_frame([d for d in all_required if d.name != missing], FRAME)
+        assert "PPE OK" not in dict(_inspection_labels(observations[0], 1))
+        vision = state()
+        events = [event for i in range(12)
+                  for event in vision.process(observations, i * 0.5, report_cases=True)]
+        assert all(event.status != "compliant" for event in events)
+
+    observations = rules.evaluate_frame(all_required, FRAME)
+    labels = dict(_inspection_labels(observations[0], 1))
+    assert "PPE OK" in labels and "Gloves missing" in labels
+    vision = state()
+    events = [event for i in range(12)
+              for event in vision.process(observations, i * 0.5, report_cases=True)]
+    event, = events
+    assert event.status == "compliant" and not event.items
+    assert event.observation.items["gloves"].status == "MISSING_POSITIVE"
+
+
 if __name__ == "__main__":
     print("PPE tracker / confirmation tests\n")
     sys.exit(_run())

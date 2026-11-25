@@ -109,11 +109,15 @@ def main() -> int:
     ap.add_argument("--no-upload", action="store_true",
                     help="queue snapshots locally but never upload")
     ap.add_argument("--no-live", action="store_true", help="disable the MJPEG server")
+    ap.add_argument("--continuous-inspection", action="store_true",
+                    help="inspect continuously with the robot stationary")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="stop after N seconds (0 = run until interrupted)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="per-frame state machine trace")
     args = ap.parse_args()
+    if args.continuous_inspection:
+        args.simulate = True  # the stationary workflow never commands the chassis
 
     from ppe_config import load_config
 
@@ -163,13 +167,17 @@ def main() -> int:
     frame_buffer = None
     mjpeg = None
     if not args.no_live:
-        frame_buffer = FrameBuffer()
+        inspection_key = cfg.portal.resolved_api_key() if args.continuous_inspection else ""
+        frame_buffer = FrameBuffer(inspection_key=inspection_key)
         mjpeg = MjpegServer(frame_buffer, port=cfg.camera.mjpeg_port)
 
     vision = PatrolVision(
         camera, shared, cfg, store=store,
         frame_buffer=frame_buffer, verbose=args.verbose,
+        continuous_inspection=args.continuous_inspection,
     )
+    if frame_buffer is not None and args.continuous_inspection:
+        frame_buffer.reset_inspection = vision.reset_inspection
     drive = PatrolDrive(car, shared, cfg)
     uploader = None
     if not (args.no_upload or cfg.dry_run):
@@ -225,7 +233,8 @@ def main() -> int:
             shutdown("vision failed to start")
             return 1
 
-        drive.start()
+        if not args.continuous_inspection:
+            drive.start()
         if uploader is not None:
             uploader.start()
 
@@ -243,7 +252,7 @@ def main() -> int:
                 print("[main] vision thread died; stopping for safety")
                 shutdown("vision thread died")
                 break
-            if not drive.is_alive() and not stopping.is_set():
+            if not args.continuous_inspection and not drive.is_alive() and not stopping.is_set():
                 print("[main] drive thread died; stopping")
                 shutdown("drive thread died")
                 break

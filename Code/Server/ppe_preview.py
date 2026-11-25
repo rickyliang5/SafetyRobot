@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument('--duration', type=float, default=0, help='seconds; 0 runs until stopped')
     args = parser.parse_args()
     cfg = load_config(args.config)
+    model_label = "PPE ensemble (SH17 + SafetyVision)" if cfg.model.ensemble_ppe else "SafetyVision nano"
     detector = PpeDetector.from_config(cfg)
     detector.warmup()
     rules = RuleEngine(cfg.rules, cfg.model)
@@ -75,7 +76,7 @@ def main() -> None:
                                 .45, (0, 0, 0), 3, cv2.LINE_AA)
                     cv2.putText(view, label, pos, cv2.FONT_HERSHEY_SIMPLEX,
                                 .45, (80, 240, 140), 1, cv2.LINE_AA)
-            status = f'SafetyVision nano | {elapsed * 1000:.0f} ms | camera preview'
+            status = f'{model_label} | {elapsed * 1000:.0f} ms | camera preview'
             cv2.putText(view, status, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
                         .5, (255, 255, 255), 1, cv2.LINE_AA)
             jpeg = encode_jpeg(view)
@@ -85,7 +86,7 @@ def main() -> None:
             buffer.publish(jpeg)
             frames += 1
             if frames == 1:
-                print(f'READY: live camera on port {args.port}; model={detector.onnx_path.name}', flush=True)
+                print(f'READY: live camera on port {args.port}; model={model_label}', flush=True)
     finally:
         server.stop()
         camera.close()

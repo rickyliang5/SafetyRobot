@@ -23,6 +23,8 @@ dead robot.
 
 from __future__ import annotations
 
+import hmac
+import json
 import socketserver
 import threading
 import time
@@ -34,13 +36,15 @@ BOUNDARY = "ppeframe"
 class FrameBuffer:
     """Latest annotated frame, shared between the vision thread and clients."""
 
-    def __init__(self) -> None:
+    def __init__(self, inspection_key: str = "") -> None:
         self._lock = threading.Lock()
         self._jpeg: bytes | None = None
         self._seq = 0
         self._condition = threading.Condition(self._lock)
         self.viewers = 0
         self.status_line = ""
+        self.inspection_key = inspection_key
+        self.reset_inspection = None
 
     def publish(self, jpeg: bytes) -> None:
         with self._condition:
@@ -83,6 +87,21 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_bytes(b'{"ok":true}', "application/json")
         else:
             self.send_error(404)
+
+    def do_POST(self) -> None:
+        reset = self.buffer.reset_inspection
+        if self.path != "/inspection-reset" or reset is None:
+            self.send_error(404)
+            return
+        provided = self.headers.get("X-API-Key", "").encode()
+        if not hmac.compare_digest(provided, self.buffer.inspection_key.encode()):
+            self.send_error(403)
+            return
+        reset_at = reset()
+        if reset_at is None:
+            self.send_error(503, "detector is starting")
+            return
+        self._send_bytes(json.dumps({"reset_at": reset_at}).encode(), "application/json")
 
     def _send_bytes(self, body: bytes, content_type: str) -> None:
         self.send_response(200)

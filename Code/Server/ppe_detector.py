@@ -492,6 +492,84 @@ _COLOURS = {
 }
 _DEFAULT_COLOUR = (190, 190, 190)
 
+_PPE_LABELS = {
+    "helmet": "Hard hat", "eye-protection": "Glasses",
+    "safety-vest": "Vest", "gloves": "Gloves",
+}
+_PPE_PRESENT = (120, 225, 145)
+_PPE_MISSING = (105, 120, 255)
+_PPE_CHECKING = (125, 205, 250)
+
+
+def _inspection_labels(obs, number: int) -> list[tuple[str, tuple[int, int, int]]]:
+    required = obs.required_items
+    if required and all(obs.items[item].status == "PRESENT" for item in required):
+        verdict = "PPE OK", _PPE_PRESENT
+    elif obs.missing_items():
+        verdict = "PPE missing", _PPE_MISSING
+    else:
+        verdict = "Checking PPE", _PPE_CHECKING
+
+    labels = [(f"#{number}", _DEFAULT_COLOUR), verdict]
+    for item, evidence in obs.items.items():
+        label = _PPE_LABELS.get(item, item.replace("-", " ").capitalize())
+        if evidence.status == "PRESENT":
+            labels.append((f"{label} OK", _PPE_PRESENT))
+        elif evidence.is_missing:
+            labels.append((f"{label} missing", _PPE_MISSING))
+        else:
+            labels.append((f"{label} ?", _PPE_CHECKING))
+    return labels
+
+
+def _annotate_inspection(frame_bgr: np.ndarray, observations: list, show_labels: bool) -> np.ndarray:
+    """Keep status outside the camera image and mark each person once."""
+    h, w = frame_bgr.shape[:2]
+    font, scale = cv2.FONT_HERSHEY_SIMPLEX, 0.40
+    row_height, padding = 20, 7
+    labels = []
+    y = h
+    if show_labels and not observations:
+        labels.append(("No person in view", _DEFAULT_COLOUR, padding, y + 14))
+        y += row_height
+    for number, obs in enumerate(observations, start=1):
+        if not show_labels:
+            break
+        x = padding
+        for text, colour in _inspection_labels(obs, number):
+            (width, _), _ = cv2.getTextSize(text, font, scale, 1)
+            if x > padding and x + width > w - padding:
+                y += row_height
+                x = padding
+            labels.append((text, colour, x, y + 14))
+            x += width + 12
+        y += row_height
+
+    out = cv2.copyMakeBorder(frame_bgr, 0, y - h, 0, 0, cv2.BORDER_CONSTANT, value=(23, 23, 23))
+    markers = []
+    for number, obs in enumerate(observations, start=1):
+        x1, y1, x2, y2 = map(int, obs.person.xyxy)
+        colour = _COLOURS["person"]
+        cv2.rectangle(out, (x1, y1), (x2, min(y2, h - 1)), colour, 1)
+        if not show_labels:
+            continue
+        marker = f"#{number}"
+        (tw, _), _ = cv2.getTextSize(marker, font, scale, 1)
+        x = max(0, min(x1, w - tw - 6))
+        y = max(0, min(y1, h - 16))
+        while y <= h - 16 and any(
+            x < right and x + tw + 6 > left and y < bottom and y + 16 > top
+            for left, top, right, bottom in markers
+        ):
+            y += 16
+        if y <= h - 16:
+            markers.append((x, y, x + tw + 6, y + 16))
+            cv2.rectangle(out, (x, y), (x + tw + 5, y + 15), (23, 23, 23), -1)
+            cv2.putText(out, marker, (x + 3, y + 11), font, scale, colour, 1, cv2.LINE_AA)
+    for text, colour, x, y in labels:
+        cv2.putText(out, text, (x, y), font, scale, colour, 1, cv2.LINE_AA)
+    return out
+
 
 def annotate(
     frame_bgr: np.ndarray,
@@ -499,49 +577,23 @@ def annotate(
     observations: list | None = None,
     show_labels: bool = True,
 ) -> np.ndarray:
-    """Draw boxes and, if given, each person's PPE verdict. Returns a copy."""
+    """Draw a compact inspection view, or raw detections for debugging."""
+    if observations is not None:
+        return _annotate_inspection(frame_bgr, observations, show_labels)
+
     out = frame_bgr.copy()
 
     for d in dets:
-        if d.name == "person":
-            continue
         colour = _COLOURS.get(d.name, _DEFAULT_COLOUR)
         p1 = (int(d.x1), int(d.y1))
         p2 = (int(d.x2), int(d.y2))
         cv2.rectangle(out, p1, p2, colour, 1)
-        if show_labels:
+        if show_labels and d.name != "person":
             cv2.putText(
                 out, f"{d.name} {d.conf:.2f}", (p1[0], max(10, p1[1] - 3)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA,
             )
 
-    if observations:
-        for obs in observations:
-            missing = obs.missing_items()
-            colour = (60, 60, 240) if missing else (90, 210, 120)
-            p1 = (int(obs.person.x1), int(obs.person.y1))
-            p2 = (int(obs.person.x2), int(obs.person.y2))
-            cv2.rectangle(out, p1, p2, colour, 2)
-            label = (
-                "NO " + ", ".join(m.upper() for m in missing)
-                if missing
-                else "PPE OK"
-            )
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            ty = max(th + 4, p1[1])
-            cv2.rectangle(out, (p1[0], ty - th - 4), (p1[0] + tw + 6, ty + 2), colour, -1)
-            cv2.putText(
-                out, label, (p1[0] + 3, ty - 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA,
-            )
-    else:
-        for d in dets:
-            if d.name != "person":
-                continue
-            cv2.rectangle(
-                out, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)),
-                _COLOURS["person"], 2,
-            )
     return out
 
 
