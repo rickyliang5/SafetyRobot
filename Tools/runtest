@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)
+server_dir="$project_dir/Code/Server"
+python_bin="${PPE_PYTHON:-$HOME/ppe-venv/bin/python}"
+
+case "${1:-}" in
+    --help|-h)
+        echo "runtest [--simulate]"
+        echo "Run one obstacle-course inspection. Ctrl+C stops the test."
+        exit 0
+        ;;
+    --simulate)
+        cd "$server_dir"
+        exec "$python_bin" test_ppe_demo.py
+        ;;
+    "") ;;
+    *) echo "Usage: runtest [--simulate]" >&2; exit 2 ;;
+esac
+
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+exec 9>"$runtime_dir/safetyrobot-runtest.lock"
+if ! flock -n 9; then
+    echo "A robot demo is already running." >&2
+    exit 1
+fi
+
+cd "$server_dir"
+test -x "$python_bin"
+if ! "$python_bin" -c 'from parameter import ParameterManager; import sys; p = ParameterManager.__new__(ParameterManager); sys.exit(not p.validate_params())'; then
+    echo "The robot hardware settings in $server_dir/params.json are missing or invalid." >&2
+    exit 1
+fi
+
+live_unit=ppe-ensemble-live
+restore_live=false
+child=
+cleanup() {
+    if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" || true
+    fi
+    if "$restore_live"; then
+        if ! systemctl --user start "$live_unit" 2>/dev/null; then
+            state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/safetyrobot"
+            mkdir -p "$state_dir"
+            systemd-run --user --unit="$live_unit" --collect \
+                --working-directory="$server_dir" \
+                --property="StandardOutput=append:$state_dir/live.log" \
+                --property=StandardError=inherit \
+                "$python_bin" -u ppe_main.py --continuous-inspection \
+                --source picamera --live-host 127.0.0.1
+        fi
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+
+if systemctl --user is-active --quiet "$live_unit"; then
+    restore_live=true
+    systemctl --user stop "$live_unit"
+fi
+
+"$python_bin" -u ppe_main.py --demo --source picamera --live-host 127.0.0.1 &
+child=$!
+status=0
+wait "$child" || status=$?
+child=
+exit "$status"

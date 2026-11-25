@@ -407,6 +407,7 @@ class ViolationConfirmer:
 
     def feed_case(
         self, track: Track, obs: PersonObservation, now: float,
+        require_complete: bool = False,
     ) -> ViolationEvent | None:
         """Report a stable PPE combination from the stationary inspection."""
         missing_evidence = {
@@ -421,6 +422,9 @@ class ViolationConfirmer:
             if evidence.status == "PRESENT" and not (positive or absent) and worn >= self.temporal.absence_n:
                 present[item] = f"{worn}/{total}"
         if not missing and (not obs.required_items or any(item not in present for item in obs.required_items)):
+            return None
+        if require_complete and any(item not in missing and item not in present
+                                    for item in obs.required_items):
             return None
         # Occlusion alone should not make a previously missing item look
         # resolved. Wait for positive evidence before reporting that change.
@@ -524,6 +528,7 @@ class PatrolVisionState:
         frame_bgr=None,
         record: bool = True,
         report_cases: bool = False,
+        require_complete: bool = False,
     ) -> list[ViolationEvent]:
         pairs = self.tracker.update(observations, now, frame_bgr, record=record)
         events: list[ViolationEvent] = []
@@ -533,7 +538,7 @@ class PatrolVisionState:
                 self.confirmer.adopt_history(track, now)
             if not record:
                 continue
-            event = (self.confirmer.feed_case(track, obs, now) if report_cases
+            event = (self.confirmer.feed_case(track, obs, now, require_complete) if report_cases
                      else self.confirmer.feed(track, now))
             if event is not None:
                 events.append(event)

@@ -109,19 +109,26 @@ def main() -> int:
     ap.add_argument("--no-upload", action="store_true",
                     help="queue snapshots locally but never upload")
     ap.add_argument("--no-live", action="store_true", help="disable the MJPEG server")
+    ap.add_argument("--live-host", default="0.0.0.0", help="address for the MJPEG server")
     ap.add_argument("--continuous-inspection", action="store_true",
                     help="inspect continuously with the robot stationary")
+    ap.add_argument("--demo", action="store_true",
+                    help="drive the obstacle course and send one complete PPE inspection")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="stop after N seconds (0 = run until interrupted)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="per-frame state machine trace")
     args = ap.parse_args()
+    if args.demo and (args.simulate or args.no_motors or args.no_upload or args.continuous_inspection):
+        ap.error("--demo uses the powered robot and uploads one result")
     if args.continuous_inspection:
         args.simulate = True  # the stationary workflow never commands the chassis
 
     from ppe_config import load_config
 
     cfg = load_config(args.config)
+    if args.demo and cfg.dry_run:
+        ap.error("--demo requires uploads to be enabled in the configuration")
 
     print("=" * 66)
     print("  PPE compliance patrol")
@@ -162,23 +169,33 @@ def main() -> int:
         print(f"  {pending} snapshot(s) already queued from a previous run\n")
 
     camera = open_camera(cfg, args.source, args.index, args.path)
-    car = open_car(simulate=args.simulate, no_motors=args.no_motors)
+    try:
+        car = open_car(simulate=args.simulate, no_motors=args.no_motors, require_hardware=args.demo)
+    except RuntimeError as exc:
+        print(f"Cannot start: {exc}")
+        return 1
 
     frame_buffer = None
     mjpeg = None
     if not args.no_live:
         inspection_key = cfg.portal.resolved_api_key() if args.continuous_inspection else ""
         frame_buffer = FrameBuffer(inspection_key=inspection_key)
-        mjpeg = MjpegServer(frame_buffer, port=cfg.camera.mjpeg_port)
+        mjpeg = MjpegServer(frame_buffer, port=cfg.camera.mjpeg_port, host=args.live_host)
 
     vision = PatrolVision(
         camera, shared, cfg, store=store,
         frame_buffer=frame_buffer, verbose=args.verbose,
         continuous_inspection=args.continuous_inspection,
+        demo=args.demo,
     )
     if frame_buffer is not None and args.continuous_inspection:
         frame_buffer.reset_inspection = vision.reset_inspection
-    drive = PatrolDrive(car, shared, cfg)
+    if args.demo:
+        from ppe_demo import DemoDrive
+
+        drive = DemoDrive(car, shared, cfg)
+    else:
+        drive = PatrolDrive(car, shared, cfg)
     uploader = None
     if not (args.no_upload or cfg.dry_run):
         uploader = uploader_from_config(cfg, store)
@@ -217,6 +234,8 @@ def main() -> int:
         return 1
 
     started = time.monotonic()
+    demo_uploaded = False
+    upload_deadline = None
     try:
         if mjpeg is not None:
             mjpeg.start()
@@ -228,11 +247,14 @@ def main() -> int:
             if vision.error or not vision.is_alive() or shared.snapshot()["frames"] > 0:
                 break
             time.sleep(0.1)
-        if vision.error:
-            print(f"[main] vision thread failed: {vision.error}")
+        if vision.error or not shared.snapshot()["frames"]:
+            print(f"[main] vision did not produce any frames: {vision.error or 'startup timed out'}")
             shutdown("vision failed to start")
             return 1
 
+        if args.demo and not uploader.health_ok():
+            shutdown(f"admin panel unavailable: {uploader.last_error}")
+            return 1
         if not args.continuous_inspection:
             drive.start()
         if uploader is not None:
@@ -246,6 +268,19 @@ def main() -> int:
         last_report = 0.0
         while not stopping.is_set():
             time.sleep(0.5)
+
+            if args.demo and (inspection_id := shared.snapshot()["inspection_id"]):
+                if upload_deadline is None:
+                    drive.stop()
+                    upload_deadline = time.monotonic() + 15
+                if any(store.sent.glob(f"*_{inspection_id[:12]}.json")):
+                    demo_uploaded = True
+                    print(f"[demo] Inspection {inspection_id[:12]} uploaded to the admin panel.")
+                    break
+                if time.monotonic() >= upload_deadline:
+                    print("[demo] Robot stopped. The inspection is queued for upload.")
+                    break
+                continue
 
             # Watchdog: if vision dies, the robot is driving blind, so stop.
             if not vision.is_alive():
@@ -308,7 +343,7 @@ def main() -> int:
             f"the next run, or now with:\n    python ppe_uploader.py --once"
         )
     print("=" * 66)
-    return 0
+    return int(args.demo and not demo_uploaded)
 
 
 if __name__ == "__main__":

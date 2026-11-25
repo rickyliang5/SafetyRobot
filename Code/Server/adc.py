@@ -14,11 +14,12 @@ class ADC:
 
     def _read_stable_byte(self) -> int:
         """Read a stable byte from the ADC."""
-        while True:
+        for _ in range(16):
             value1 = self.i2c_bus.read_byte(self.I2C_ADDRESS)                 # Read the first byte from the ADC
             value2 = self.i2c_bus.read_byte(self.I2C_ADDRESS)                 # Read the second byte from the ADC
             if value1 == value2:
                 return value1                                                 # Return the value if both reads are the same
+        raise RuntimeError("ADC samples did not settle")
 
     def read_adc(self, channel: int) -> float:
         """Read the ADC value for the specified channel using ADS7830."""

@@ -90,6 +90,7 @@ class SharedState:
     frames_total: int = 0
     frames_recorded: int = 0
     infer_ms: float = 0.0
+    inspection_id: str | None = None
 
     # ------------------------------------------------------------- accessors
 
@@ -109,6 +110,7 @@ class SharedState:
                 "frames": self.frames_total,
                 "recorded": self.frames_recorded,
                 "infer_ms": round(self.infer_ms, 1),
+                "inspection_id": self.inspection_id,
             }
 
     def may_record(self) -> bool:
@@ -286,13 +288,17 @@ class NoMotorCar:
         self.inner.close()
 
 
-def open_car(simulate: bool = False, no_motors: bool = False) -> CarInterface:
+def open_car(
+    simulate: bool = False, no_motors: bool = False, require_hardware: bool = False,
+) -> CarInterface:
     if simulate:
         print("[patrol] using a simulated car (no hardware)")
         return SimulatedCar()
     try:
         car: CarInterface = RealCar()
     except Exception as exc:
+        if require_hardware:
+            raise RuntimeError(f"robot hardware unavailable: {exc}") from exc
         print(f"[patrol] hardware unavailable ({exc}); falling back to simulation")
         return SimulatedCar()
     if no_motors:
@@ -646,6 +652,7 @@ class PatrolVision(threading.Thread):
         frame_buffer=None,
         verbose: bool = False,
         continuous_inspection: bool = False,
+        demo: bool = False,
     ) -> None:
         super().__init__(name="ppe-vision", daemon=True)
         self.camera = camera
@@ -655,6 +662,7 @@ class PatrolVision(threading.Thread):
         self.frame_buffer = frame_buffer
         self.verbose = verbose
         self.continuous_inspection = continuous_inspection
+        self.demo = demo
         self._inspection_lock = threading.Lock()
         self._inspection_reset_at = float("-inf")
         self._stop_event = threading.Event()
@@ -731,9 +739,12 @@ class PatrolVision(threading.Thread):
                     continue
                 events = self.vision_state.process(
                     observations, now=time.monotonic(), frame_bgr=frame, record=recording,
-                    report_cases=self.continuous_inspection,
+                    report_cases=self.continuous_inspection or self.demo,
+                    require_complete=self.demo,
                 )
                 for event in events:
+                    if self.demo and self.shared.snapshot()["inspection_id"]:
+                        break
                     self._handle_violation(event, frame, (width, height))
             with self.shared.lock:
                 self.shared.frames_total += 1
@@ -785,7 +796,7 @@ class PatrolVision(threading.Thread):
         # Snapshot the clearest confirming frame the tracker cached, not
         # whichever frame happened to tip the counter over.
         track = self.vision_state.tracker.tracks.get(event.track_id)
-        best = track.best_frame if track and not self.continuous_inspection else None
+        best = track.best_frame if track and not (self.continuous_inspection or self.demo) else None
         evidence_frame = best if best is not None else frame
 
         state = self.shared.snapshot()
@@ -810,6 +821,9 @@ class PatrolVision(threading.Thread):
             try:
                 event_id = self.store.write_event(evidence_frame, payload)
                 print(f"[vision] queued snapshot {event_id[:12]}")
+                if self.demo:
+                    with self.shared.lock:
+                        self.shared.inspection_id = event_id
             except Exception as exc:
                 print(f"[vision] could not write snapshot: {exc}")
 
