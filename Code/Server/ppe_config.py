@@ -49,6 +49,12 @@ class ModelConfig:
                   the strength of it is not.
     veto_conf     minimum for a PPE detection to clear a person outright.
                   Deliberately low -- positive evidence should win easily.
+    hint_conf     a PPE detection between this and its class_conf is too
+                  weak to count as wearing it, but strong enough that the
+                  frame can't count as proof it's missing either: the item
+                  becomes UNKNOWN for that frame. On real footage a hard hat
+                  the model is unsure of scores ~0.2-0.4, while a bare head
+                  produces no hard-hat detection at all.
     """
 
     scan_onnx: str = "models/ppe_yolo8n_448.onnx"
@@ -56,6 +62,7 @@ class ModelConfig:
     pt_path: str = "../../yolo8n.pt"
     backend: str = "onnx"  # "onnx" | "ultralytics" (PC validation only)
     conf_default: float = 0.30
+    hint_conf: float = 0.15
     iou_nms: float = 0.45
     intra_op_threads: int = 3  # leave a core for the camera encoder + drive loop
     class_conf: dict[str, float] = field(
@@ -150,6 +157,20 @@ class RulesConfig:
     min_person_area_frac: float = 0.02
     edge_margin_px: int = 8
     absence_requires_full_view: bool = True
+    # Fraction of a person's torso (20-65% down their box) in fluorescent
+    # hi-vis yellow/green above which "no vest" can't be called: the model
+    # misses real vests on crouching or seated people, but the colour is
+    # unmistakable. On real footage: vests 14-36%, no vest 0-7%. A veto only
+    # -- a yellow T-shirt yields "can't tell", never "wearing a vest".
+    # 0 disables.
+    hivis_veto_frac: float = 0.10
+    # Same idea for hard hats: share of the top of the head box (plus a
+    # little above it) in saturated hard-hat yellow above which "no hard hat"
+    # can't be called. The model has scored a plainly visible yellow hard hat
+    # at 0.04. On real footage: hats 15-54%, bare heads 0-2%. Yellow/lime
+    # hats only -- orange overlaps skin tone and white overlaps lighting.
+    # 0 disables.
+    hardhat_colour_veto_frac: float = 0.08
 
     def __post_init__(self) -> None:
         for item in self.required_ppe:
@@ -177,12 +198,31 @@ class TemporalConfig:
     positive_n: int = 5  # bare-body-part proof: 5 of 10
     absence_n: int = 8   # absence-only items: stricter, 8 of 10
     min_track_hits: int = 4
+    # The agreeing frames must also span at least this long, so a burst of
+    # bad frames from one moment (a sneeze, a turn of the head) can't convict
+    # anyone. 0 disables the time requirement.
+    min_duration_s: float = 0.0
+    # Report a person as COMPLIANT once every required item has been seen on
+    # them in this many frames, with no frame saying missing. 0 = only ever
+    # report violations.
+    compliant_n: int = 0
+    # Once an item is confirmed missing, wait until every other item is
+    # decided too (or this many seconds of judged frames have passed), so a
+    # person gets ONE report listing everything rather than a report per
+    # item. 0 reports as soon as anything is confirmed.
+    decide_timeout_s: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0 < self.positive_n <= self.window_m:
             raise ValueError("temporal.positive_n must be in 1..window_m")
         if not 0 < self.absence_n <= self.window_m:
             raise ValueError("temporal.absence_n must be in 1..window_m")
+        if self.min_duration_s < 0:
+            raise ValueError("temporal.min_duration_s must be >= 0")
+        if not 0 <= self.compliant_n <= self.window_m:
+            raise ValueError("temporal.compliant_n must be in 0..window_m")
+        if self.decide_timeout_s < 0:
+            raise ValueError("temporal.decide_timeout_s must be >= 0")
 
 
 @dataclass(frozen=True)

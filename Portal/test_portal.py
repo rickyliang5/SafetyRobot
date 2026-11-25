@@ -249,8 +249,8 @@ def test_per_item_rows_are_written():
     with Harness() as h:
         post(h.client, meta(missing=["helmet", "safety-vest"]))
         page = h.client.get("/?item=safety-vest").get_data(as_text=True)
-        assert "helmet + safety-vest" in page
-        assert "1 violation" in page
+        assert "Hard hat + Safety vest" in page
+        assert "1 inspection" in page
 
 
 # --------------------------------------------------------------------------
@@ -261,7 +261,7 @@ def test_per_item_rows_are_written():
 def test_empty_gallery_has_an_empty_state():
     with Harness() as h:
         page = h.client.get("/").get_data(as_text=True)
-        assert "No violations" in page
+        assert "No inspections" in page
 
 
 def test_gallery_lists_and_detail_renders():
@@ -271,12 +271,12 @@ def test_gallery_lists_and_detail_renders():
 
         gallery = h.client.get("/")
         assert gallery.status_code == 200
-        assert "1 violation" in gallery.get_data(as_text=True)
+        assert "1 inspection" in gallery.get_data(as_text=True)
 
         detail = h.client.get(f"/v/{vid}")
         assert detail.status_code == 200
         text = detail.get_data(as_text=True)
-        assert "Missing: helmet" in text
+        assert "Not wearing: Hard hat" in text
         assert "missing positive" in text
         assert "bare head at 0.88" in text
 
@@ -305,6 +305,37 @@ def test_images_are_served():
         assert full.status_code == 200
         assert full.data[:3] == b"\xff\xd8\xff"
         assert h.client.get(f"/thumbs/{rel}").status_code == 200
+
+
+def test_reset_clears_dashboard_and_keeps_only_new_captures_visible():
+    from unittest.mock import patch
+
+    with Harness() as h:
+        h.app.config["INSPECTION_RESET_URL"] = "http://robot/inspection-reset"
+        cutoff = datetime.now(timezone.utc)
+        before = (cutoff - timedelta(seconds=5)).isoformat()
+        after = (cutoff + timedelta(seconds=5)).isoformat()
+        old = meta(captured_at=before)
+        old_id = post(h.client, old).get_json()["id"]
+        old_path = h.client.get("/api/v1/violations").get_json()[0]["image"]
+        h.client.get("/")
+        with h.client.session_transaction() as session:
+            csrf = session["csrf_token"]
+        assert h.client.post("/inspection-reset").status_code == 400
+        with patch("requests.post") as robot:
+            robot.return_value.json.return_value = {"reset_at": cutoff.timestamp()}
+            result = h.client.post("/inspection-reset", data={"csrf_token": csrf})
+        assert result.status_code == 303
+        assert "No inspections" in h.client.get(result.location).get_data(as_text=True)
+        assert h.client.get(f"/v/{old_id}").status_code == 404
+        assert h.client.get(old_path).status_code == 404
+        assert post(h.client, old).status_code == 409
+        assert post(h.client, meta(captured_at=before)).status_code == 201
+        assert h.client.get("/api/v1/health").get_json()["count"] == 0
+        fresh = {**compliant_meta(), "captured_at": after}
+        assert post(h.client, fresh).status_code == 201
+        assert h.client.get("/api/v1/health").get_json()["count"] == 1
+        assert "All PPE OK" in h.client.get("/").get_data(as_text=True)
 
 
 def test_image_path_traversal_is_blocked():
@@ -365,20 +396,20 @@ def test_filters_narrow_the_gallery():
             robot_id="freenove-02",
         ))
 
-        assert "2 violations" in h.client.get("/").get_data(as_text=True)
-        assert "1 violation" in h.client.get("/?item=helmet").get_data(as_text=True)
-        assert "1 violation" in h.client.get(
+        assert "2 inspections" in h.client.get("/").get_data(as_text=True)
+        assert "1 inspection" in h.client.get("/?item=helmet").get_data(as_text=True)
+        assert "1 inspection" in h.client.get(
             "/?robot=freenove-02"
         ).get_data(as_text=True)
-        assert "2 violations" in h.client.get(
+        assert "2 inspections" in h.client.get(
             "/?reviewed=0"
         ).get_data(as_text=True)
-        assert "No violations" in h.client.get(
+        assert "No inspections" in h.client.get(
             "/?reviewed=1"
         ).get_data(as_text=True)
 
         yesterday = (now - timedelta(days=1)).date().isoformat()
-        assert "1 violation" in h.client.get(
+        assert "1 inspection" in h.client.get(
             f"/?from={yesterday}"
         ).get_data(as_text=True)
 
@@ -388,7 +419,7 @@ def test_date_to_filter_includes_the_whole_day():
     with Harness() as h:
         post(h.client, meta(captured_at="2026-10-22T15:30:00+00:00"))
         page = h.client.get("/?to=2026-10-22").get_data(as_text=True)
-        assert "1 violation" in page
+        assert "1 inspection" in page
 
 
 def test_stats_reports_precision_from_reviews():
@@ -509,6 +540,150 @@ def test_live_page_renders():
         text = h.client.get("/live").get_data(as_text=True)
         assert "Live view" in text
         assert "Robot offline" in text  # the hidden fallback element
+
+
+# --------------------------------------------------------------------------
+# compliant reports and face photos
+# --------------------------------------------------------------------------
+
+
+def compliant_meta(**extra) -> dict:
+    return meta(
+        missing=(),
+        status="compliant",
+        required_ppe=["helmet", "eye-protection"],
+        present_ppe=["eye-protection", "helmet"],
+        evidence={
+            "helmet": {"status": "PRESENT", "support": {"helmet": 0.9}},
+            "eye-protection": {"status": "PRESENT", "support": {"glasses": 0.8}},
+        },
+        **extra,
+    )
+
+
+def post_with_face(client, payload, face):
+    return client.post(
+        "/api/v1/violations",
+        data={
+            "metadata": json.dumps(payload),
+            "image": (io.BytesIO(make_jpeg()), "f.jpg"),
+            "face": (io.BytesIO(face), "face.jpg"),
+        },
+        headers={"X-API-Key": API_KEY},
+        content_type="multipart/form-data",
+    )
+
+
+def test_compliant_report_is_stored_and_shown():
+    with Harness() as h:
+        res = post(h.client, compliant_meta())
+        assert res.status_code == 201, res.get_data(as_text=True)
+        vid = res.get_json()["id"]
+        page = h.client.get("/").get_data(as_text=True)
+        assert "All PPE OK" in page
+        detail = h.client.get(f"/v/{vid}").get_data(as_text=True)
+        assert "Wearing all required PPE" in detail
+        assert detail.count("&#10003; Wearing") == 2
+
+
+def test_non_compliant_needs_missing_items_and_compliant_cannot_have_them():
+    with Harness() as h:
+        assert post(h.client, meta(missing=())).status_code == 400
+        bad = compliant_meta()
+        bad["missing_ppe"] = ["helmet"]
+        assert post(h.client, bad).status_code == 400
+        assert post(h.client, meta(status="sort-of")).status_code == 400
+
+
+def test_compliant_report_can_show_optional_gloves_missing():
+    with Harness() as h:
+        payload = compliant_meta()
+        payload["optional_ppe"] = ["gloves"]
+        payload["evidence"]["gloves"] = {"status": "MISSING_POSITIVE", "support": {"hands": 0.9}}
+        vid = post(h.client, payload).get_json()["id"]
+        html = h.client.get(f"/v/{vid}").get_data(as_text=True)
+        assert "Wearing all required PPE" in html
+        assert "Gloves <small>(optional)</small>" in html
+        assert "&#10007; Not wearing" in html
+
+
+def test_status_filter_and_compliance_rate():
+    with Harness() as h:
+        post(h.client, meta())
+        post(h.client, compliant_meta())
+        post(h.client, compliant_meta())
+        assert "1 inspection" in h.client.get("/?status=non_compliant").get_data(as_text=True)
+        page = h.client.get("/?status=compliant").get_data(as_text=True)
+        assert "2 inspections" in page
+        assert "67%" in page, "2 of 3 compliant"
+
+
+def test_face_photo_is_stored_and_shown():
+    with Harness() as h:
+        res = post_with_face(h.client, meta(), make_jpeg(120, 160))
+        assert res.status_code == 201, res.get_data(as_text=True)
+        vid = res.get_json()["id"]
+        detail = h.client.get(f"/v/{vid}").get_data(as_text=True)
+        assert "face-photo" in detail
+        assert "Not wearing: Hard hat" in detail
+        row = h.client.get("/").get_data(as_text=True)
+        assert "face-inset" in row
+        face_url = [w for w in detail.split('"') if w.endswith("_face.jpg")][0]
+        assert h.client.get(face_url).status_code == 200
+
+
+def test_face_that_is_not_a_jpeg_is_rejected():
+    with Harness() as h:
+        res = post_with_face(h.client, meta(), b"definitely not a jpeg")
+        assert res.status_code == 400
+
+
+def test_old_database_gains_new_columns():
+    import sqlite3
+
+    import db as dbmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "old.sqlite3"
+        old_schema = dbmod.SCHEMA.replace(
+            ",\n  status         TEXT    NOT NULL DEFAULT 'non_compliant', -- or 'compliant'\n"
+            "  face_path      TEXT,                      -- face crop, relative to data/images\n"
+            "  archived       INTEGER NOT NULL DEFAULT 0",
+            "",
+        )
+        assert "face_path" not in old_schema, "test must build a genuinely old schema"
+        conn = sqlite3.connect(path)
+        conn.executescript(old_schema)
+        conn.close()
+        dbmod.init_db(path)
+        conn = sqlite3.connect(path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(violations)")}
+        conn.close()
+        assert {"status", "face_path", "archived"} <= cols
+
+
+def test_checklist_uses_the_robots_per_item_decision():
+    with Harness() as h:
+        payload = meta(
+            missing=["helmet"],
+            required_ppe=["helmet", "eye-protection", "safety-vest"],
+            verdicts={"helmet": "MISSING", "eye-protection": "OK", "safety-vest": "UNSURE"},
+        )
+        vid = post(h.client, payload).get_json()["id"]
+        page = h.client.get(f"/v/{vid}").get_data(as_text=True)
+        assert "&#10007; Not wearing" in page
+        assert "&#10003; Wearing" in page
+        assert "Couldn't tell" in page
+
+
+def test_api_list_includes_status_and_face():
+    with Harness() as h:
+        post_with_face(h.client, meta(), make_jpeg(120, 160))
+        post(h.client, compliant_meta())
+        rows = h.client.get("/api/v1/violations").get_json()
+        assert {r["status"] for r in rows} == {"compliant", "non_compliant"}
+        assert any(r["face"] for r in rows)
+        assert [r["missing_ppe"] for r in rows if r["status"] == "compliant"] == [[]]
 
 
 # --------------------------------------------------------------------------

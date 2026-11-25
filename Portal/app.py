@@ -68,7 +68,19 @@ PAGE_SIZE = 48
 THUMB_WIDTH = 360
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 
-REQUIRED_META_KEYS = ("event_id", "captured_at", "missing_ppe")
+# Human names for the robot's PPE item keys.
+ITEM_LABELS = {
+    "helmet": "Hard hat",
+    "eye-protection": "Safety glasses",
+    "safety-vest": "Safety vest",
+    "gloves": "Gloves",
+    "shoes": "Safety shoes",
+    "face-mask": "Face mask",
+    "ear-protection": "Ear protection",
+}
+
+# missing_ppe is checked separately: a compliant report's list is empty.
+REQUIRED_META_KEYS = ("event_id", "captured_at")
 
 
 # --------------------------------------------------------------------------
@@ -168,6 +180,7 @@ def create_app() -> Flask:
         ROBOT_MJPEG_URL=os.environ.get(
             "PPE_ROBOT_MJPEG", "http://192.168.129.51:8080/stream.mjpg"
         ),
+        INSPECTION_RESET_URL=os.environ.get("PPE_INSPECTION_RESET_URL", ""),
     )
 
     admin_password = os.environ.get("PPE_ADMIN_PASSWORD", "")
@@ -217,8 +230,11 @@ def create_app() -> Flask:
         return {
             "csrf_token": session.get("csrf_token", ""),
             "review_labels": dbmod.REVIEW_LABELS,
+            "status_labels": dbmod.STATUS_LABELS,
+            "item_label": lambda item: ITEM_LABELS.get(item, item.replace("-", " ")),
             "auth_enabled": bool(app.config["ADMIN_PASSWORD_HASH"]),
             "authed": session.get("authed", False),
+            "inspection_reset_enabled": bool(app.config["INSPECTION_RESET_URL"]),
         }
 
     # ------------------------------------------------------------------ auth
@@ -257,6 +273,7 @@ def create_app() -> Flask:
             "date_from": request.args.get("from") or None,
             "date_to": request.args.get("to") or None,
             "reviewed": request.args.get("reviewed"),
+            "status": request.args.get("status") or None,
         }
         total = dbmod.count_violations(conn, **filters)
         rows = dbmod.list_violations(
@@ -333,18 +350,20 @@ def create_app() -> Flask:
             "date_from": request.args.get("from") or None,
             "date_to": request.args.get("to") or None,
             "reviewed": request.args.get("reviewed"),
+            "status": request.args.get("status") or None,
         }
         buf = io.StringIO()
         writer = csv.writer(buf, lineterminator="\n")
         writer.writerow(
             ["id", "event_id", "robot", "zone", "captured_at", "received_at",
-             "missing_ppe", "person_conf", "battery_v", "cpu_temp_c",
+             "status", "missing_ppe", "person_conf", "battery_v", "cpu_temp_c",
              "review", "notes"]
         )
         for r in dbmod.export_rows(conn, **filters):
             writer.writerow(
                 [r["id"], r["event_id"], r["robot_id"], r["zone_label"],
-                 r["captured_at"], r["received_at"], r["missing_ppe"],
+                 r["captured_at"], r["received_at"],
+                 dbmod.STATUS_LABELS.get(r["status"], r["status"]), r["missing_ppe"],
                  r["person_conf"], r["battery_v"], r["cpu_temp_c"],
                  dbmod.REVIEW_LABELS.get(r["reviewed"], r["reviewed"]), r["notes"]]
             )
@@ -359,15 +378,42 @@ def create_app() -> Flask:
     @app.route("/images/<path:rel>")
     @login_required
     def image(rel: str):
-        # send_from_directory rejects traversal; don't hand-roll path joining.
-        return send_from_directory(IMAGE_ROOT, rel, max_age=3600)
+        if not dbmod.inspection_image_exists(get_db(), rel, thumbnail=False):
+            abort(404)
+        return send_from_directory(IMAGE_ROOT, rel, max_age=0)
 
     @app.route("/thumbs/<path:rel>")
     @login_required
     def thumb(rel: str):
-        return send_from_directory(THUMB_ROOT, rel, max_age=3600)
+        if not dbmod.inspection_image_exists(get_db(), rel, thumbnail=True):
+            abort(404)
+        return send_from_directory(THUMB_ROOT, rel, max_age=0)
 
     # ------------------------------------------------------------- live feed
+
+    @app.route("/inspection-reset", methods=["POST"])
+    @login_required
+    def inspection_reset():
+        import requests
+
+        url = app.config["INSPECTION_RESET_URL"]
+        if not url:
+            abort(404)
+        check_csrf()
+        destination = "live_page" if request.form.get("return_to") == "live" else "gallery"
+        try:
+            upstream = requests.post(
+                url, timeout=5,
+                headers={"X-API-Key": app.config["API_KEY"]},
+            )
+            upstream.raise_for_status()
+            reset_at = datetime.fromtimestamp(upstream.json()["reset_at"], timezone.utc)
+        except (requests.RequestException, ValueError, KeyError, TypeError, OverflowError):
+            flash("Could not reset the inspection camera. Try again.")
+        else:
+            dbmod.reset_inspections(get_db(), reset_at.isoformat())
+            flash("Inspections cleared. Scanning for new cases.")
+        return redirect(url_for(destination), code=303)
 
     @app.route("/live/stream.mjpg")
     @login_required
@@ -441,8 +487,17 @@ def create_app() -> Flask:
         missing_keys = [k for k in REQUIRED_META_KEYS if not meta.get(k)]
         if missing_keys:
             return jsonify({"error": f"metadata missing {missing_keys}"}), 400
-        if not isinstance(meta.get("missing_ppe"), list) or not meta["missing_ppe"]:
-            return jsonify({"error": "missing_ppe must be a non-empty list"}), 400
+        status = meta.get("status") or "non_compliant"
+        if status not in dbmod.STATUS_LABELS:
+            return jsonify({"error": f"unknown status {status!r}"}), 400
+        meta["status"] = status
+        missing_ppe = meta.get("missing_ppe")
+        if not isinstance(missing_ppe, list):
+            return jsonify({"error": "missing_ppe must be a list"}), 400
+        if status == "non_compliant" and not missing_ppe:
+            return jsonify({"error": "a non-compliant report must list missing_ppe"}), 400
+        if status == "compliant" and missing_ppe:
+            return jsonify({"error": "a compliant report cannot list missing_ppe"}), 400
 
         event_id = str(meta["event_id"])[:64]
 
@@ -472,6 +527,10 @@ def create_app() -> Flask:
             return jsonify({"error": "image part is empty"}), 400
         if not is_jpeg(data):
             return jsonify({"error": "image is not a readable JPEG"}), 400
+        face_upload = request.files.get("face")
+        face_data = face_upload.read() if face_upload is not None else b""
+        if face_data and not is_jpeg(face_data):
+            return jsonify({"error": "face is not a readable JPEG"}), 400
 
         # 5. write the file first, then the row. A crash in between leaves an
         #    orphan file (harmless, reapable) rather than a row pointing at
@@ -491,6 +550,14 @@ def create_app() -> Flask:
 
         thumb_rel = rel if write_thumbnail(data, THUMB_ROOT / rel) else None
 
+        face_rel = None
+        if face_data:
+            face_rel = rel[: -len(".jpg")] + "_face.jpg"
+            face_dest = IMAGE_ROOT / face_rel
+            face_tmp = face_dest.with_suffix(".jpg.tmp")
+            face_tmp.write_bytes(face_data)
+            os.replace(face_tmp, face_dest)
+
         try:
             violation_id = dbmod.insert_violation(
                 conn,
@@ -499,6 +566,7 @@ def create_app() -> Flask:
                 thumb_path=thumb_rel,
                 image_bytes=len(data),
                 received_at=utc_now_iso(),
+                face_path=face_rel,
             )
         except sqlite3.IntegrityError:
             # Two concurrent POSTs of the same event; the other one won.
@@ -512,6 +580,8 @@ def create_app() -> Flask:
         except Exception as exc:
             dest.unlink(missing_ok=True)
             (THUMB_ROOT / rel).unlink(missing_ok=True)
+            if face_rel:
+                (IMAGE_ROOT / face_rel).unlink(missing_ok=True)
             return jsonify({"error": f"insert failed: {exc}"}), 500
 
         return (
@@ -535,9 +605,11 @@ def create_app() -> Flask:
                     "event_id": r["event_id"],
                     "captured_at": r["captured_at"],
                     "robot_id": r["robot_id"],
-                    "missing_ppe": r["missing_ppe"].split(","),
+                    "status": r["status"],
+                    "missing_ppe": [i for i in r["missing_ppe"].split(",") if i],
                     "reviewed": r["reviewed"],
                     "image": url_for("image", rel=r["image_path"]),
+                    "face": url_for("image", rel=r["face_path"]) if r["face_path"] else None,
                 }
                 for r in rows
             ]

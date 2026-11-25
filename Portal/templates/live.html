@@ -7,6 +7,9 @@
   Boxes and PPE verdicts are drawn on the robot, so this is exactly what the
   detector sees.
 </p>
+{% with inspection_return = "live" %}
+  {% include "inspection_controls.html" %}
+{% endwith %}
 <div class="livewrap">
   <img id="live" src="{{ url_for('live_stream') }}" alt="live robot view">
   <div id="offline" class="offline" hidden>

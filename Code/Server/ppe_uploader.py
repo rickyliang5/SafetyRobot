@@ -150,14 +150,21 @@ class Uploader(threading.Thread):
             # Pruned or dropped underneath us; treat as done.
             return True, False
 
+        files = {
+            "metadata": ("meta.json", meta_bytes, "application/json"),
+            "image": (f"{event.event_id}.jpg", image_bytes, "image/jpeg"),
+        }
+        try:
+            files["face"] = (f"{event.event_id}_face.jpg", event.face.read_bytes(),
+                             "image/jpeg")
+        except FileNotFoundError:
+            pass  # compliant reports and older events have no face crop
+
         try:
             res = requests.post(
                 self.ingest_url,
                 headers={"X-API-Key": self.api_key},
-                files={
-                    "metadata": ("meta.json", meta_bytes, "application/json"),
-                    "image": (f"{event.event_id}.jpg", image_bytes, "image/jpeg"),
-                },
+                files=files,
                 timeout=self.timeout,
             )
         except Exception as exc:

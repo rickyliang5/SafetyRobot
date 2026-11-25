@@ -12,11 +12,16 @@ def observation(status, box=(100, 100, 200, 400)):
 
 
 def helmet_only_config():
-    # The fake observations carry only a helmet verdict, so pin the required
-    # list instead of inheriting whatever ppe_config.json currently enforces.
+    # The fake observations carry only a helmet verdict, and the frame counts
+    # below assume 5-of-10 with 4 track hits, so pin both instead of
+    # inheriting whatever ppe_config.json currently uses.
     cfg = load_config()
     return dataclasses.replace(
-        cfg, rules=dataclasses.replace(cfg.rules, required_ppe=('helmet',)))
+        cfg,
+        rules=dataclasses.replace(cfg.rules, required_ppe=('helmet',)),
+        temporal=dataclasses.replace(
+            cfg.temporal, window_m=10, positive_n=5, absence_n=8, min_track_hits=4),
+    )
 
 
 class InspectionTests(unittest.TestCase):

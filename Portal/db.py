@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS violations (
   image_bytes    INTEGER,
   metadata_json  TEXT    NOT NULL,          -- full payload, verbatim
   reviewed       INTEGER NOT NULL DEFAULT 0, -- 0 new, 1 confirmed, 2 false pos
-  notes          TEXT
+  notes          TEXT,
+  status         TEXT    NOT NULL DEFAULT 'non_compliant', -- or 'compliant'
+  face_path      TEXT,                      -- face crop, relative to data/images
+  archived       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_v_captured ON violations(captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_v_reviewed ON violations(reviewed);
@@ -66,9 +69,23 @@ CREATE TABLE IF NOT EXISTS robots (
   last_cpu_temp_c REAL,
   total_events   INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS inspection_reset (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  cutoff TEXT NOT NULL
+);
 """
 
 REVIEW_LABELS = {0: "New", 1: "Confirmed", 2: "False positive"}
+STATUS_LABELS = {"non_compliant": "Not compliant", "compliant": "Compliant"}
+
+# Columns added after the first release, as (name, DDL). init_db adds any an
+# existing database is missing, so upgrading never loses recorded events.
+_ADDED_COLUMNS = (
+    ("status", "TEXT NOT NULL DEFAULT 'non_compliant'"),
+    ("face_path", "TEXT"),
+    ("archived", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -85,6 +102,18 @@ def init_db(db_path: str | Path) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(violations)")}
+        for name, ddl in _ADDED_COLUMNS:
+            if name not in have:
+                conn.execute(f"ALTER TABLE violations ADD COLUMN {name} {ddl}")
+        # After the migration: on an old database the column doesn't exist
+        # until the ALTER above.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_v_status ON violations(status, captured_at DESC)"
+        )
+        conn.execute(
+            "CREATE VIEW IF NOT EXISTS active_violations AS SELECT * FROM violations WHERE archived = 0"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -102,6 +131,33 @@ def find_by_event_id(conn: sqlite3.Connection, event_id: str) -> sqlite3.Row | N
     ).fetchone()
 
 
+def reset_inspections(conn: sqlite3.Connection, cutoff: str) -> None:
+    """Archive records from before the camera reset, including late uploads."""
+    with conn:
+        conn.execute(
+            """INSERT INTO inspection_reset (id, cutoff) VALUES (1, ?)
+               ON CONFLICT(id) DO UPDATE SET cutoff = MAX(cutoff, excluded.cutoff)""",
+            (cutoff,),
+        )
+        conn.execute(
+            """UPDATE violations SET archived = 1
+               WHERE archived = 0 AND (
+                   received_at <= (SELECT cutoff FROM inspection_reset)
+                   OR julianday(captured_at) <= julianday((SELECT cutoff FROM inspection_reset))
+               )"""
+        )
+
+
+def inspection_image_exists(conn: sqlite3.Connection, path: str, thumbnail: bool) -> bool:
+    if thumbnail:
+        query, params = "thumb_path = ?", (path,)
+    else:
+        query, params = "image_path = ? OR face_path = ?", (path, path)
+    return conn.execute(
+        f"SELECT 1 FROM active_violations WHERE {query} LIMIT 1", params
+    ).fetchone() is not None
+
+
 def insert_violation(
     conn: sqlite3.Connection,
     *,
@@ -110,6 +166,7 @@ def insert_violation(
     thumb_path: str | None,
     image_bytes: int,
     received_at: str,
+    face_path: str | None = None,
 ) -> int:
     """Insert a violation and its per-item rows in one transaction.
 
@@ -129,8 +186,10 @@ def insert_violation(
               clock_synced, missing_ppe, person_conf,
               bbox_x1, bbox_y1, bbox_x2, bbox_y2, frame_w, frame_h,
               battery_v, cpu_temp_c, image_path, thumb_path, image_bytes,
-              metadata_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              metadata_json, status, face_path, archived
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, COALESCE(
+                julianday(?) <= julianday((SELECT cutoff FROM inspection_reset)), 0
+            ))
             """,
             (
                 meta["event_id"],
@@ -149,6 +208,9 @@ def insert_violation(
                 thumb_path,
                 image_bytes,
                 json.dumps(meta, separators=(",", ":")),
+                meta.get("status") or "non_compliant",
+                face_path,
+                meta["captured_at"],
             ),
         )
         violation_id = int(cur.lastrowid)
@@ -205,7 +267,8 @@ def set_review(
 
 def delete_violation(conn: sqlite3.Connection, violation_id: int) -> sqlite3.Row | None:
     row = conn.execute(
-        "SELECT image_path, thumb_path FROM violations WHERE id = ?", (violation_id,)
+        "SELECT image_path, thumb_path, face_path FROM violations WHERE id = ?",
+        (violation_id,),
     ).fetchone()
     if row is None:
         return None
@@ -229,6 +292,7 @@ def build_filters(
     date_from: str | None = None,
     date_to: str | None = None,
     reviewed: str | None = None,
+    status: str | None = None,
 ) -> tuple[str, list[Any]]:
     """Shared WHERE clause so the gallery, CSV export and counts agree."""
     where: list[str] = []
@@ -252,6 +316,9 @@ def build_filters(
     if reviewed not in (None, "", "all"):
         where.append("v.reviewed = ?")
         params.append(int(reviewed))
+    if status in STATUS_LABELS:
+        where.append("v.status = ?")
+        params.append(status)
 
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     return clause, params
@@ -267,7 +334,7 @@ def list_violations(
     clause, params = build_filters(**filters)
     return conn.execute(
         f"""
-        SELECT v.* FROM violations v
+        SELECT v.* FROM active_violations v
         {clause}
         ORDER BY v.captured_at DESC, v.id DESC
         LIMIT ? OFFSET ?
@@ -279,14 +346,14 @@ def list_violations(
 def count_violations(conn: sqlite3.Connection, **filters: Any) -> int:
     clause, params = build_filters(**filters)
     row = conn.execute(
-        f"SELECT COUNT(*) AS n FROM violations v {clause}", params
+        f"SELECT COUNT(*) AS n FROM active_violations v {clause}", params
     ).fetchone()
     return int(row["n"])
 
 
 def get_violation(conn: sqlite3.Connection, violation_id: int) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT * FROM violations WHERE id = ?", (violation_id,)
+        "SELECT * FROM active_violations WHERE id = ?", (violation_id,)
     ).fetchone()
 
 
@@ -305,13 +372,13 @@ def neighbours(
     if row is None:
         return None, None
     newer = conn.execute(
-        """SELECT id FROM violations
+        """SELECT id FROM active_violations
            WHERE (captured_at, id) > (?, ?)
            ORDER BY captured_at ASC, id ASC LIMIT 1""",
         (row["captured_at"], violation_id),
     ).fetchone()
     older = conn.execute(
-        """SELECT id FROM violations
+        """SELECT id FROM active_violations
            WHERE (captured_at, id) < (?, ?)
            ORDER BY captured_at DESC, id DESC LIMIT 1""",
         (row["captured_at"], violation_id),
@@ -321,13 +388,14 @@ def neighbours(
 
 def distinct_robots(conn: sqlite3.Connection) -> list[str]:
     return [r["robot_id"] for r in conn.execute(
-        "SELECT robot_id FROM robots ORDER BY robot_id"
+        "SELECT DISTINCT robot_id FROM active_violations ORDER BY robot_id"
     )]
 
 
 def distinct_items(conn: sqlite3.Connection) -> list[str]:
     return [r["item"] for r in conn.execute(
-        "SELECT DISTINCT item FROM violation_items ORDER BY item"
+        """SELECT DISTINCT i.item FROM violation_items i
+           JOIN active_violations v ON v.id = i.violation_id ORDER BY i.item"""
     )]
 
 
@@ -338,31 +406,42 @@ def stats(conn: sqlite3.Connection) -> dict[str, Any]:
     events only. It is the number to look at before tightening thresholds or
     before enabling an absence-only item like safety-vest.
     """
-    total = int(conn.execute("SELECT COUNT(*) n FROM violations").fetchone()["n"])
+    total = count_violations(conn)
     by_review = {
         int(r["reviewed"]): int(r["n"])
         for r in conn.execute(
-            "SELECT reviewed, COUNT(*) n FROM violations GROUP BY reviewed"
+            "SELECT reviewed, COUNT(*) n FROM active_violations GROUP BY reviewed"
         )
     }
     by_item = {
         r["item"]: int(r["n"])
         for r in conn.execute(
-            "SELECT item, COUNT(*) n FROM violation_items GROUP BY item ORDER BY n DESC"
+            """SELECT i.item, COUNT(*) n FROM violation_items i
+               JOIN active_violations v ON v.id = i.violation_id GROUP BY i.item ORDER BY n DESC"""
         )
     }
     by_day = [
         {"day": r["day"], "n": int(r["n"])}
         for r in conn.execute(
             """SELECT substr(captured_at, 1, 10) day, COUNT(*) n
-               FROM violations GROUP BY day ORDER BY day DESC LIMIT 30"""
+               FROM active_violations GROUP BY day ORDER BY day DESC LIMIT 30"""
         )
     ]
+    by_status = {
+        r["status"]: int(r["n"])
+        for r in conn.execute("SELECT status, COUNT(*) n FROM active_violations GROUP BY status")
+    }
+    compliant = by_status.get("compliant", 0)
+    non_compliant = by_status.get("non_compliant", 0)
+    inspected = compliant + non_compliant
     confirmed = by_review.get(1, 0)
     false_pos = by_review.get(2, 0)
     judged = confirmed + false_pos
     return {
         "total": total,
+        "compliant": compliant,
+        "non_compliant": non_compliant,
+        "compliance_rate": round(compliant / inspected, 3) if inspected else None,
         "new": by_review.get(0, 0),
         "confirmed": confirmed,
         "false_positive": false_pos,
@@ -370,7 +449,12 @@ def stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "precision": round(confirmed / judged, 3) if judged else None,
         "by_item": by_item,
         "by_day": by_day,
-        "robots": [dict(r) for r in conn.execute("SELECT * FROM robots")],
+        "robots": [dict(r) for r in conn.execute(
+            """SELECT r.robot_id, r.last_seen, r.last_battery_v, r.last_cpu_temp_c,
+                      COUNT(v.id) AS total_events
+               FROM robots r JOIN active_violations v ON r.robot_id = v.robot_id
+               GROUP BY r.robot_id"""
+        )],
     }
 
 
@@ -378,9 +462,9 @@ def export_rows(conn: sqlite3.Connection, **filters: Any) -> Iterable[sqlite3.Ro
     clause, params = build_filters(**filters)
     return conn.execute(
         f"""SELECT v.id, v.event_id, v.robot_id, v.zone_label, v.captured_at,
-                   v.received_at, v.missing_ppe, v.person_conf, v.battery_v,
+                   v.received_at, v.status, v.missing_ppe, v.person_conf, v.battery_v,
                    v.cpu_temp_c, v.reviewed, v.notes
-            FROM violations v {clause}
+            FROM active_violations v {clause}
             ORDER BY v.captured_at DESC""",
         params,
     )

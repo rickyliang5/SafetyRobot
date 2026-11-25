@@ -1,0 +1,17 @@
+// Give the CAM/DISP 1 camera power switch a start-up delay.
+// The Arducam IMX519 needs ~41 ms after power-on before it answers on I2C;
+// with no delay the imx519 driver reads its chip ID too early (0x707) and
+// fails, both at boot and when it powers the sensor up to stream.
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2712";
+
+	fragment@0 {
+		target = <&cam1_reg>;
+		__overlay__ {
+			startup-delay-us = <100000>;
+		};
+	};
+};

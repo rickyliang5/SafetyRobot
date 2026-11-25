@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% block title %}Violation {{ v.id }} &middot; PPE Patrol{% endblock %}
+{% block title %}Inspection {{ v.id }} &middot; PPE Patrol{% endblock %}
 {% block content %}
 
 <div class="detail-head">
-  <a class="btn" href="{{ url_for('gallery') }}">&larr; All violations</a>
+  <a class="btn" href="{{ url_for('gallery') }}">&larr; All inspections</a>
   <div class="spacer"></div>
   {% if newer %}<a class="btn" href="{{ url_for('detail', violation_id=newer) }}">Newer</a>{% endif %}
   {% if older %}<a class="btn" href="{{ url_for('detail', violation_id=older) }}">Older</a>{% endif %}
@@ -15,21 +15,50 @@
        from the recorded coordinates, so the evidence stays unannotated and
        re-reviewable. #}
     <div class="imgwrap">
-      <img src="{{ url_for('image', rel=v.image_path) }}" alt="violation {{ v.id }}">
+      <img src="{{ url_for('image', rel=v.image_path) }}" alt="inspection {{ v.id }}">
       {% if v.bbox_x1 is not none and v.frame_w %}
-      <div class="bbox" style="
+      <div class="bbox {{ v.status }}" aria-hidden="true" style="
         left:{{ (v.bbox_x1 / v.frame_w * 100) | round(3) }}%;
         top:{{ (v.bbox_y1 / v.frame_h * 100) | round(3) }}%;
         width:{{ ((v.bbox_x2 - v.bbox_x1) / v.frame_w * 100) | round(3) }}%;
-        height:{{ ((v.bbox_y2 - v.bbox_y1) / v.frame_h * 100) | round(3) }}%;">
-        <span>{{ v.missing_ppe.replace(',', ' + ') | upper }}</span>
-      </div>
+        height:{{ ((v.bbox_y2 - v.bbox_y1) / v.frame_h * 100) | round(3) }}%;"></div>
       {% endif %}
     </div>
   </div>
 
   <aside class="panel">
-    <h1>Missing: {{ v.missing_ppe.replace(',', ', ') }}</h1>
+    {% if v.status == 'compliant' %}
+    <span class="verdict compliant">&#10003; Compliant</span>
+    <h1>Wearing all required PPE</h1>
+    {% else %}
+    <span class="verdict non_compliant">&#10007; Not compliant</span>
+    <h1>Not wearing: {% for i in v.missing_ppe.split(',') %}{{ item_label(i) }}{% if not loop.last %}, {% endif %}{% endfor %}</h1>
+    {% endif %}
+
+    {% if v.face_path %}
+    <a href="{{ url_for('image', rel=v.face_path) }}"><img class="face-photo" src="{{ url_for('image', rel=v.face_path) }}" alt="face of person {{ v.id }}"></a>
+    {% endif %}
+
+    {# Every required item, from the robot's report: what was fine, what wasn't. #}
+    {# Prefer the robot's decision per item ("verdicts", decided over many
+       frames); older reports only carry the single photographed frame. #}
+    {% set required = meta.get('required_ppe') or v.missing_ppe.split(',') %}
+    {% set optional = meta.get('optional_ppe') or [] %}
+    {% set verdicts = meta.get('verdicts') or {} %}
+    {% set evidence = meta.get('evidence') or {} %}
+    {% set missing = v.missing_ppe.split(',') if v.missing_ppe else [] %}
+    <table class="kv checklist">
+      {% for item in required + optional %}
+      {% set decided = verdicts.get(item) %}
+      {% set st = (evidence.get(item) or {}).get('status') or '' %}
+      <tr>
+        <th>{{ item_label(item) }}{% if item in optional %} <small>(optional)</small>{% endif %}</th>
+        {% if item in missing or decided == 'MISSING' or (item in optional and st.startswith('MISSING')) %}<td class="missing">&#10007; Not wearing</td>
+        {% elif decided == 'OK' or (not verdicts and (st == 'PRESENT' or (v.status == 'compliant' and item in required))) %}<td class="ok">&#10003; Wearing</td>
+        {% else %}<td class="unknown">Couldn't tell</td>{% endif %}
+      </tr>
+      {% endfor %}
+    </table>
 
     <table class="kv">
       <tr><th>Captured</th><td>{{ v.captured_at[:19].replace('T', ' ') }} UTC
@@ -43,7 +72,8 @@
       <tr><th>Event ID</th><td class="mono small">{{ v.event_id }}</td></tr>
     </table>
 
-    <h2>Evidence</h2>
+    {% if items %}
+    <h2>Why it was flagged</h2>
     <table class="kv items">
       {% for it in items %}
       <tr>
@@ -56,6 +86,7 @@
       </tr>
       {% endfor %}
     </table>
+    {% endif %}
     {% if items | selectattr('status', 'equalto', 'MISSING_ABSENT') | list %}
     <p class="note">
       <strong>Absence-based.</strong> This item was judged missing because no

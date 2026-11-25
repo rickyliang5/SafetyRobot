@@ -43,8 +43,51 @@ class PendingEvent:
     image: Path
     meta: Path
 
+    @property
+    def face(self) -> Path:
+        """Optional face crop, stored beside the evidence frame."""
+        return face_path_for(self.meta)
+
     def load_meta(self) -> dict:
         return json.loads(self.meta.read_text(encoding="utf-8"))
+
+
+def face_path_for(meta_path: Path) -> Path:
+    return meta_path.with_name(meta_path.stem + "_face.jpg")
+
+
+def crop_face(frame_bgr, observation, min_height: int = 160):
+    """Crop a person's face for the report, or None if there's nothing usable.
+
+    Prefers the detected face, then the head, then the top fifth of the
+    person box. Padded so the crop shows the whole head -- what they are or
+    aren't wearing on it is the point -- and upscaled so a small, distant
+    face is still recognisable on the portal.
+    """
+    import cv2
+
+    box = None
+    for cls in ("face", "head"):
+        dets = observation.attached.get(cls) or []
+        if dets:
+            box = max(dets, key=lambda d: d.conf).xyxy
+            break
+    if box is None:
+        x1, y1, x2, y2 = observation.person.xyxy
+        box = (x1, y1, x2, y1 + (y2 - y1) * 0.2)
+
+    x1, y1, x2, y2 = box
+    pad_x, pad_y = (x2 - x1) * 0.35, (y2 - y1) * 0.35
+    h, w = frame_bgr.shape[:2]
+    x1, x2 = max(0, int(x1 - pad_x)), min(w, int(x2 + pad_x))
+    y1, y2 = max(0, int(y1 - pad_y)), min(h, int(y2 + pad_y))
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.shape[0] < min_height:
+        scale = min_height / crop.shape[0]
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return crop
 
 
 def utc_now_iso() -> str:
@@ -123,11 +166,12 @@ class SnapshotStore:
 
     # ------------------------------------------------------------------ write
 
-    def write_event(self, frame_bgr, payload: dict) -> str:
-        """Persist one violation. Returns the event_id.
+    def write_event(self, frame_bgr, payload: dict, face_bgr=None) -> str:
+        """Persist one event. Returns the event_id.
 
         `frame_bgr` is a raw BGR numpy frame; `payload` is the metadata dict,
-        which must carry an event_id (one is generated if absent).
+        which must carry an event_id (one is generated if absent). `face_bgr`
+        is an optional face crop, uploaded alongside.
         """
         import cv2
 
@@ -154,6 +198,19 @@ class SnapshotStore:
         img_tmp = img_path.with_suffix(".jpg.tmp")
         img_tmp.write_bytes(buf.tobytes())
         os.replace(img_tmp, img_path)
+
+        # The face crop is also written before the JSON commit marker.
+        payload["face_image"] = False
+        if face_bgr is not None:
+            ok, fbuf = cv2.imencode(
+                ".jpg", face_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+            )
+            if ok:
+                face_path = face_path_for(meta_path)
+                face_tmp = face_path.with_suffix(".jpg.tmp")
+                face_tmp.write_bytes(fbuf.tobytes())
+                os.replace(face_tmp, face_path)
+                payload["face_image"] = True
 
         meta_tmp = meta_path.with_suffix(".json.tmp")
         meta_tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
@@ -201,7 +258,7 @@ class SnapshotStore:
 
     def _quarantine(self, meta_path: Path, img_path: Path, reason: str) -> None:
         print(f"[snapshots] quarantining {meta_path.name}: {reason}")
-        for src in (meta_path, img_path):
+        for src in (meta_path, img_path, face_path_for(meta_path)):
             if src.is_file():
                 try:
                     shutil.move(str(src), str(self.failed / src.name))
@@ -210,7 +267,7 @@ class SnapshotStore:
 
     def _move(self, event: PendingEvent, dest_dir: Path) -> None:
         dest_dir.mkdir(parents=True, exist_ok=True)
-        for src in (event.image, event.meta):
+        for src in (event.image, event.face, event.meta):
             if not src.is_file():
                 continue
             dest = dest_dir / src.name
@@ -244,6 +301,7 @@ class SnapshotStore:
         )
         for event in events[:drop]:
             event.image.unlink(missing_ok=True)
+            event.face.unlink(missing_ok=True)
             event.meta.unlink(missing_ok=True)
 
     def prune(self) -> int:
@@ -259,9 +317,10 @@ class SnapshotStore:
             if not f.is_file():
                 continue
             # Orphan .jpg (no committing .json) or a leftover .tmp from an
-            # interrupted write.
+            # interrupted write. A face crop belongs to <base>.json.
+            base = f.name[: -len("_face.jpg")] if f.name.endswith("_face.jpg") else f.stem
             if f.suffix == ".tmp" or (
-                f.suffix == ".jpg" and not f.with_suffix(".json").is_file()
+                f.suffix == ".jpg" and not (f.parent / f"{base}.json").is_file()
             ):
                 if time.time() - f.stat().st_mtime > 60:  # let live writes finish
                     f.unlink(missing_ok=True)
@@ -311,18 +370,30 @@ def build_payload(
         "clock_synced": clock_is_synced(),
         "monotonic_s": round(time.monotonic(), 3),
         "required_ppe": list(cfg.rules.required_ppe),
+        "status": getattr(event, "status", "non_compliant"),
         "missing_ppe": list(event.items),
+        "present_ppe": list(getattr(event, "present", [])),
+        "unsure_ppe": list(getattr(event, "unsure", [])),
+        # The decision per item, which is what the portal shows. "evidence"
+        # below is the single photographed frame and can differ on items
+        # that were decided over time.
+        "verdicts": {
+            **{i: "OK" for i in getattr(event, "present", [])},
+            **{i: "UNSURE" for i in getattr(event, "unsure", [])},
+            **{i: "MISSING" for i in event.items},
+        },
         "track_id": event.track_id,
         "person_conf": round(float(observation.person.conf), 4),
         "person_bbox": [round(float(v), 1) for v in observation.person.xyxy],
         "frame_size": [int(frame_shape[0]), int(frame_shape[1])],
+        # Every assessed item, not only the missing ones, so the portal can
+        # show what was fine as well as what wasn't.
         "evidence": {
             item: {
-                **observation.items[item].to_json(),
+                **evidence.to_json(),
                 "frames_agree": event.frames_agree.get(item),
             }
-            for item in event.items
-            if item in observation.items
+            for item, evidence in observation.items.items()
         },
         "detections": [
             d.to_json()

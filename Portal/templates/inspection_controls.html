@@ -1,0 +1,7 @@
+{% if inspection_reset_enabled %}
+<form class="inspection-controls" method="post" action="{{ url_for('inspection_reset') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="return_to" value="{{ inspection_return | default('inspections') }}">
+  <button class="btn primary" type="submit">Reset inspections</button>
+</form>
+{% endif %}

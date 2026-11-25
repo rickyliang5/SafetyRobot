@@ -291,21 +291,27 @@ def test_max_per_hour_is_a_hard_cap():
     assert len(emitted) == 3, f"cap is 3/hour, emitted {len(emitted)}"
 
 
-def test_second_item_on_a_reported_track_still_fires():
-    """Cooldown is per item, so a NEW violation is not swallowed."""
-    st = state(temporal_kw={"positive_n": 2, "min_track_hits": 2})
-    for i in range(6):
-        st.process(observe(bare_head_frame(), required=["helmet"]), now=float(i))
-
-    # Same person, now also assessed for gloves with bare hands visible.
-    dets = bare_head_frame() + [det("hands", (255.0, 250.0, 300.0, 300.0), 0.80)]
+def test_second_item_goes_on_the_persons_next_report():
+    """One card per person: a newly-confirmed item waits for the cooldown."""
+    st = state(
+        temporal_kw={"positive_n": 2, "min_track_hits": 2},
+        cooldown_kw={"per_person_s": 20.0, "global_min_interval_s": 0.0},
+    )
+    req = ["helmet", "gloves"]
+    gloved = bare_head_frame() + [det("gloves", (255.0, 250.0, 300.0, 300.0), 0.80)]
+    bare = bare_head_frame() + [det("hands", (255.0, 250.0, 300.0, 300.0), 0.80)]
     events = []
-    for i in range(6, 14):
-        events.extend(
-            st.process(observe(dets, required=["helmet", "gloves"]), now=float(i))
-        )
-    assert any("gloves" in e.items for e in events), "a new item should report"
-    assert not any("helmet" in e.items for e in events), "helmet already reported"
+    for i in range(6):
+        events += st.process(observe(gloved, required=req), now=float(i))
+    assert [e.items for e in events] == [["helmet"]]
+    # Gloves come off a few seconds later: no second card yet...
+    for i in range(6, 20):
+        events += st.process(observe(bare, required=req), now=float(i))
+    assert len(events) == 1, "a second card for the same person within the cooldown"
+    # ...it's on their next report, once the cooldown lapses.
+    for i in range(20, 30):
+        events += st.process(observe(bare, required=req), now=float(i))
+    assert len(events) == 2 and "gloves" in events[1].items
 
 
 # --------------------------------------------------------------------------
@@ -364,6 +370,159 @@ def test_window_slides_and_drops_old_verdicts():
         pairs = tracker.update(observe(bare_head_frame()), now=float(i))
     track = pairs[0][0]
     assert track.counts("helmet")[3] == 4, "history must be capped at the window"
+
+
+# --------------------------------------------------------------------------
+# time-based confirmation, compliant reports, steady display
+# --------------------------------------------------------------------------
+
+
+def test_violation_waits_for_min_duration():
+    # 10 agreeing frames 0.1 s apart is a burst, not a sustained condition.
+    vs = state({"min_duration_s": 2.0})
+    events = []
+    for i in range(10):
+        events += vs.process(observe(bare_head_frame()), now=i * 0.1)
+    assert events == [], "a 1 s burst must not convict"
+    # At the robot's real ~4 fps the same 10-frame window covers 2+ seconds.
+    t = 1.0
+    for _ in range(10):
+        t += 0.3
+        events += vs.process(observe(bare_head_frame()), now=t)
+    assert len(events) == 1 and events[0].items == ["helmet"]
+    assert events[0].status == "non_compliant"
+
+
+def test_compliant_reported_once_per_person():
+    vs = state({"compliant_n": 5})
+    events = []
+    for i in range(20):
+        events += vs.process(observe(helmeted_frame()), now=float(i))
+    assert len(events) == 1, f"one compliant report expected, got {len(events)}"
+    assert events[0].status == "compliant"
+    assert events[0].items == [] and events[0].present == ["helmet"]
+
+
+def test_compliant_off_by_default():
+    vs = state()
+    events = []
+    for i in range(20):
+        events += vs.process(observe(helmeted_frame()), now=float(i))
+    assert events == []
+
+
+def test_one_missing_frame_blocks_compliant():
+    vs = state({"compliant_n": 5})
+    frames = [helmeted_frame()] * 4 + [bare_head_frame()] + [helmeted_frame()] * 4
+    events = []
+    for i, f in enumerate(frames):
+        events += vs.process(observe(f), now=float(i))
+    assert events == [], "a missing frame inside the window must veto compliant"
+
+
+def test_display_holds_through_flicker():
+    vs = state({"compliant_n": 5})
+    for i in range(8):
+        obs = observe(helmeted_frame())
+        vs.process(obs, now=float(i))
+    assert vs.display_for(obs)[0] == {"helmet": "OK"}
+    # A single bad frame must not flip the label.
+    obs = observe(bare_head_frame())
+    vs.process(obs, now=8.0)
+    assert vs.display_for(obs)[0] == {"helmet": "OK"}
+
+
+def test_display_starts_checking_then_missing():
+    vs = state()
+    obs = observe(bare_head_frame())
+    vs.process(obs, now=0.0)
+    assert vs.display_for(obs)[0] == {"helmet": "CHECKING"}
+    for i in range(1, 8):
+        obs = observe(bare_head_frame())
+        vs.process(obs, now=float(i))
+    assert vs.display_for(obs)[0] == {"helmet": "MISSING"}
+
+
+# --------------------------------------------------------------------------
+# one report per person, with a photo that matches it
+# --------------------------------------------------------------------------
+
+NEAR_FACE = (300.0, 125.0, 340.0, 165.0)
+NEAR_GLASSES = (300.0, 135.0, 340.0, 150.0)
+
+
+def bare_head_and_face():
+    return bare_head_frame() + [det("face", NEAR_FACE, 0.85)]
+
+
+def test_waits_and_reports_all_missing_items_together():
+    """The split-card bug: helmet confirmed first, glasses a little later."""
+    st = state({"decide_timeout_s": 30.0, "compliant_n": 5})
+    req = ["helmet", "eye-protection"]
+    events = []
+    # Glasses look fine at first, so only the helmet is decided...
+    frames = [bare_head_frame() + [det("face", NEAR_FACE, 0.85), det("glasses", NEAR_GLASSES, 0.8)]] * 3
+    # ...then they come off and the face is bare.
+    frames += [bare_head_and_face()] * 12
+    for i, f in enumerate(frames):
+        events += st.process(observe(f, required=req), now=float(i))
+    assert len(events) == 1, f"one report per person expected, got {len(events)}"
+    assert events[0].items == ["eye-protection", "helmet"]
+
+
+def test_long_watched_person_still_gets_one_card():
+    """Track 23's bug: a person watched for a while, then hat off, then
+    glasses off a few seconds later, got a separate card per item."""
+    st = state({"decide_timeout_s": 5.0}, {"per_person_s": 1000.0})
+    req = ["helmet", "eye-protection"]
+    face, glasses = det("face", NEAR_FACE, 0.85), det("glasses", NEAR_GLASSES, 0.8)
+    all_on = helmeted_frame() + [face, glasses]
+    hat_off = bare_head_frame() + [face, glasses]
+    both_off = bare_head_frame() + [face]
+    timeline = [all_on] * 40 + [hat_off] * 3 + [both_off] * 20
+    events = []
+    for i, frame in enumerate(timeline):
+        events += st.process(observe(frame, required=req), now=float(i))
+    assert len(events) == 1, f"expected one card, got {[e.items for e in events]}"
+    assert "helmet" in events[0].items
+
+
+def test_reports_after_timeout_with_unsure_items():
+    """An item that never resolves must not hold a violation back forever."""
+    st = state({"decide_timeout_s": 4.0})
+    req = ["helmet", "eye-protection"]   # no face box -> glasses stay unsure
+    events = []
+    for i in range(12):
+        events += st.process(observe(bare_head_frame(), required=req), now=float(i))
+    assert len(events) == 1
+    assert events[0].items == ["helmet"] and events[0].unsure == ["eye-protection"]
+
+
+def test_no_compliant_card_straight_after_a_violation():
+    st = state({"compliant_n": 5})
+    events = []
+    for i in range(10):
+        events += st.process(observe(bare_head_frame()), now=float(i))
+    for i in range(10, 25):   # puts the helmet on within the cooldown
+        events += st.process(observe(helmeted_frame()), now=float(i))
+    assert [e.status for e in events] == ["non_compliant"]
+
+
+def test_photo_agrees_with_the_verdict():
+    """The stale-photo bug: a clear early frame must not illustrate a later verdict."""
+    st = state()
+    events = []
+    # A very confident frame WITH a helmet, then the helmet comes off.
+    events += st.process(observe(
+        [det("person", NEAR_PERSON, 0.99), det("helmet", NEAR_HELMET, 0.80)]
+    ), now=0.0)
+    for i in range(1, 15):
+        events += st.process(observe(bare_head_frame()), now=float(i))
+    assert events, "should have confirmed"
+    assert events[0].observation.items["helmet"].is_missing, (
+        "the report photo shows the helmet on"
+    )
+    assert events[0].frame is None  # no camera frames in these tests
 
 
 # --------------------------------------------------------------------------

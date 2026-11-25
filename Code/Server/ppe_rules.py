@@ -104,11 +104,20 @@ class RuleEngine:
     # ---------------------------------------------------------------- public
 
     def evaluate_frame(
-        self, dets: list[Detection], frame_shape: tuple[int, int]
+        self,
+        dets: list[Detection],
+        frame_shape: tuple[int, int],
+        hints: list[Detection] | None = None,
+        frame_bgr=None,
     ) -> list[PersonObservation]:
         """Assess every person in a frame.
 
-        `frame_shape` is (width, height) in pixels.
+        `frame_shape` is (width, height) in pixels. `hints` are weak PPE
+        detections (see ModelConfig.hint_conf): one inside a person's box
+        turns a MISSING verdict for that item into UNKNOWN, because "the
+        model isn't sure it sees a hard hat" is not proof there isn't one.
+        With `frame_bgr`, a torso full of hi-vis colour does the same for
+        safety-vest (see RulesConfig.hivis_veto_frac).
         """
         persons = [
             d
@@ -125,8 +134,58 @@ class RuleEngine:
 
         for obs in observations:
             for item in self.rules.required_ppe:
-                obs.items[item] = self._assess_item(obs, item)
+                evidence = self._assess_item(obs, item)
+                if evidence.is_missing and hints:
+                    evidence = self._hint_veto(obs, item, hints) or evidence
+                if (
+                    evidence.is_missing
+                    and item == "safety-vest"
+                    and frame_bgr is not None
+                    and self.rules.hivis_veto_frac > 0
+                ):
+                    frac = hivis_fraction(frame_bgr, obs.person.xyxy)
+                    if frac >= self.rules.hivis_veto_frac:
+                        evidence = ItemEvidence(
+                            "UNKNOWN",
+                            {"hivis_frac": frac},
+                            f"{frac:.0%} of torso is hi-vis colour; vest likely but not detected",
+                        )
+                if (
+                    evidence.is_missing
+                    and item == "helmet"
+                    and frame_bgr is not None
+                    and self.rules.hardhat_colour_veto_frac > 0
+                ):
+                    heads = obs.attached.get("head") or []
+                    if heads:
+                        head = max(heads, key=lambda d: d.conf)
+                        frac = hardhat_colour_fraction(frame_bgr, head.xyxy)
+                        if frac >= self.rules.hardhat_colour_veto_frac:
+                            evidence = ItemEvidence(
+                                "UNKNOWN",
+                                {"hardhat_colour_frac": frac},
+                                f"{frac:.0%} of head top is hard-hat yellow; hat likely but not detected",
+                            )
+                obs.items[item] = evidence
         return observations
+
+    def _hint_veto(
+        self, obs: PersonObservation, item: str, hints: list[Detection]
+    ) -> ItemEvidence | None:
+        """UNKNOWN if a weak detection of this item sits on this person."""
+        present_classes = PPE_ITEMS[item][0]
+        x1, y1, x2, y2 = obs.person.xyxy
+        for hint in hints:
+            if hint.name not in present_classes:
+                continue
+            cx, cy = (hint.x1 + hint.x2) / 2.0, (hint.y1 + hint.y2) / 2.0
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                return ItemEvidence(
+                    "UNKNOWN",
+                    {hint.name: hint.conf},
+                    f"possible {hint.name} at {hint.conf:.2f}; too unsure to call it missing",
+                )
+        return None
 
     # --------------------------------------------------------------- helpers
 
@@ -329,6 +388,47 @@ class RuleEngine:
                 if overlap_frac(bare.xyxy, ppe.xyxy) > self.rules.ppe_cover_overlap_min:
                     return ppe
         return None
+
+
+def hivis_fraction(frame_bgr, person_xyxy) -> float:
+    """Share of the torso region that is fluorescent yellow/green.
+
+    Hi-vis fabric is saturated and bright at hue ~20-45 (OpenCV's 0-180
+    scale), which very little else in a room is.
+    """
+    import cv2
+
+    h_img, w_img = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = person_xyxy
+    height = y2 - y1
+    ty1, ty2 = int(y1 + 0.20 * height), int(y1 + 0.65 * height)
+    tx1, tx2 = int(x1), int(x2)
+    ty1, ty2 = max(0, ty1), min(h_img, ty2)
+    tx1, tx2 = max(0, tx1), min(w_img, tx2)
+    if ty2 - ty1 < 4 or tx2 - tx1 < 4:
+        return 0.0
+    hsv = cv2.cvtColor(frame_bgr[ty1:ty2, tx1:tx2], cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    mask = (hue >= 20) & (hue <= 45) & (sat >= 90) & (val >= 120)
+    return float(mask.mean())
+
+
+def hardhat_colour_fraction(frame_bgr, head_xyxy) -> float:
+    """Share of the top of a head (and just above it) in hard-hat yellow."""
+    import cv2
+
+    h_img, w_img = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = head_xyxy
+    height = y2 - y1
+    ty1, ty2 = int(y1 - 0.15 * height), int(y1 + 0.45 * height)
+    ty1, ty2 = max(0, ty1), min(h_img, ty2)
+    tx1, tx2 = max(0, int(x1)), min(w_img, int(x2))
+    if ty2 - ty1 < 4 or tx2 - tx1 < 4:
+        return 0.0
+    hsv = cv2.cvtColor(frame_bgr[ty1:ty2, tx1:tx2], cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    mask = (hue >= 18) & (hue <= 40) & (sat >= 110) & (val >= 130)
+    return float(mask.mean())
 
 
 def summarize(observations: list[PersonObservation]) -> str:

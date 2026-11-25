@@ -18,10 +18,13 @@
   },
 
   "temporal": {
-    "window_m": 10,
-    "positive_n": 5,
-    "absence_n": 8,
-    "min_track_hits": 4
+    "window_m": 15,
+    "positive_n": 8,
+    "absence_n": 12,
+    "min_track_hits": 4,
+    "min_duration_s": 2.0,
+    "compliant_n": 8,
+    "decide_timeout_s": 5.0
   },
 
   "cooldown": {

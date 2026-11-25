@@ -156,6 +156,15 @@ class CarInterface(Protocol):
     def close(self) -> None: ...
 
 
+def sonar_ok(car) -> bool:
+    """False when the car reports its ultrasonic has stopped answering.
+
+    Cars without the check (tests, the simulator) are assumed healthy.
+    """
+    check = getattr(car, "sonar_ok", None)
+    return True if check is None else bool(check())
+
+
 class RealCar:
     """Adapter over upstream's `Car`, which owns all the device objects.
 
@@ -165,11 +174,24 @@ class RealCar:
     """
 
     reverse_motors = False
+    # A reading older than this means the sensor has stopped answering.
+    SONAR_STALE_S = 1.0
 
     def __init__(self) -> None:
         from car import Car
 
         self.car = Car()
+        # gpiozero's DistanceSensor blocks forever when no echo ever comes
+        # back -- an unplugged or loose sensor. Read it on its own thread so
+        # that can't freeze the drive loop, which would otherwise keep the
+        # wheels turning with nothing watching where they go.
+        self._sonar_value: float | None = None
+        self._sonar_at = float("-inf")
+        self._sonar_lock = threading.Lock()
+        self._sonar_thread = threading.Thread(
+            target=self._sonar_loop, name="ppe-sonar", daemon=True
+        )
+        self._sonar_thread.start()
         self._pcb_version = 2
         try:
             from parameter import ParameterManager
@@ -194,8 +216,28 @@ class RealCar:
         # servo.py does not clamp, and a servo driven past its stop stalls.
         self.car.servo.set_servo_pwm(str(channel), int(max(20, min(160, angle))))
 
+    def _sonar_loop(self) -> None:
+        while True:
+            try:
+                value = self.car.sonic.get_distance()  # may block indefinitely
+            except Exception:
+                value = None
+            if value is not None:
+                with self._sonar_lock:
+                    self._sonar_value = float(value)
+                    self._sonar_at = time.monotonic()
+            time.sleep(0.03)
+
     def get_distance(self) -> float | None:
-        return self.car.sonic.get_distance()
+        """Latest reading, or None if the sensor has gone quiet."""
+        with self._sonar_lock:
+            if time.monotonic() - self._sonar_at > self.SONAR_STALE_S:
+                return None
+            return self._sonar_value
+
+    def sonar_ok(self) -> bool:
+        with self._sonar_lock:
+            return time.monotonic() - self._sonar_at <= self.SONAR_STALE_S
 
     def battery_voltage(self) -> float:
         # Multiplier depends on Pcb_Version, not Pi_Version (main.py:124).
@@ -288,6 +330,9 @@ class NoMotorCar:
     def get_distance(self) -> float | None:
         return self.inner.get_distance()
 
+    def sonar_ok(self) -> bool:
+        return sonar_ok(self.inner)
+
     def battery_voltage(self) -> float:
         return self.inner.battery_voltage()
 
@@ -350,6 +395,7 @@ class PatrolDrive(threading.Thread):
         self._last_battery_check = 0.0
         self._last_look_up = time.monotonic()
         self._periodic_hold = False
+        self._sonar_warned = False
         self._tilt_ready_at = 0.0
         self.scan_only = scan_only
         # Use the configured upward PPE angle as the lowest search view.
@@ -390,6 +436,12 @@ class PatrolDrive(threading.Thread):
             self._check_battery(now)
             if self.scan_only and self.state != LOW_BATTERY:
                 self._tick_search(now)
+                return
+
+            if self.state in (BLOCKED_SCAN, RECOVER) and not sonar_ok(self.car):
+                # Both pivot or reverse based on readings; never on stale ones.
+                self._brake()
+                self._enter(WANDER)
                 return
 
             handler = {
@@ -509,6 +561,19 @@ class PatrolDrive(threading.Thread):
             self._enter(HOLD)
             self._periodic_hold = True
             return
+
+        if not sonar_ok(self.car):
+            # Blind: stay put. Look-ups above still run, so PPE inspection
+            # carries on while someone reseats the sensor cable.
+            self._brake()
+            if not self._sonar_warned:
+                print("[drive] ultrasonic not answering -- holding still "
+                      "(check its cable); inspection continues")
+                self._sonar_warned = True
+            return
+        if self._sonar_warned:
+            print("[drive] ultrasonic answering again -- resuming")
+            self._sonar_warned = False
 
         distance = self._read_distance()
         if distance < self.p.stop_distance_cm:
@@ -846,14 +911,18 @@ class PatrolVision(threading.Thread):
             height, width = frame.shape[:2]
             t0 = time.perf_counter()
             try:
-                detections = self.detector.detect(frame)
+                detections, hints = self.detector.detect_with_hints(
+                    frame, self.cfg.model.hint_conf
+                )
             except Exception as exc:
                 print(f"[vision] inference failed: {exc}")
                 self._stop_event.wait(0.5)
                 continue
             infer_ms = (time.perf_counter() - t0) * 1000.0
 
-            observations = self.engine.evaluate_frame(detections, (width, height))
+            observations = self.engine.evaluate_frame(
+                detections, (width, height), hints=hints, frame_bgr=frame
+            )
             self._update_person_telemetry(observations, height, infer_ms)
 
             # Only frames captured while stopped and settled count toward
@@ -927,13 +996,19 @@ class PatrolVision(threading.Thread):
         self.shared.ask_hold(bool(candidates))
 
     def _handle_violation(self, event, frame, frame_shape) -> None:
-        from ppe_snapshot import build_payload
+        from ppe_snapshot import build_payload, crop_face
+        from ppe_tracker import COMPLIANT
+
+        compliant = event.status == COMPLIANT
 
         # Snapshot the clearest confirming frame the tracker cached, not
         # whichever frame happened to tip the counter over.
-        track = self.vision_state.tracker.tracks.get(event.track_id)
-        best = getattr(track, "best_frame", None) if track else None
-        evidence_frame = best if best is not None else frame
+        evidence_frame = getattr(event, "frame", None)
+        if evidence_frame is None:
+            track = self.vision_state.tracker.tracks.get(event.track_id)
+            attr = "best_ok_frame" if compliant else "best_frame"
+            best = getattr(track, attr, None) if track else None
+            evidence_frame = best if best is not None else frame
 
         state = self.shared.snapshot()
         payload = build_payload(
@@ -946,17 +1021,28 @@ class PatrolVision(threading.Thread):
             sonic_cm=state["sonic_cm"],
         )
 
-        items = ", ".join(event.items)
         agree = ", ".join(f"{k} {v}" for k, v in event.frames_agree.items())
-        print(f"[vision] VIOLATION track {event.track_id}: no {items} ({agree})")
+        face = None
+        if compliant:
+            print(f"[vision] COMPLIANT track {event.track_id}: "
+                  f"{', '.join(event.present)} ({agree})")
+        else:
+            print(f"[vision] VIOLATION track {event.track_id}: "
+                  f"no {', '.join(event.items)} ({agree})")
+            try:
+                face = crop_face(evidence_frame, event.observation)
+            except Exception as exc:
+                print(f"[vision] face crop failed: {exc}")
 
         if self.store is not None:
             try:
-                event_id = self.store.write_event(evidence_frame, payload)
+                event_id = self.store.write_event(evidence_frame, payload, face_bgr=face)
                 print(f"[vision] queued snapshot {event_id[:12]}")
             except Exception as exc:
                 print(f"[vision] could not write snapshot: {exc}")
 
+        if compliant:
+            return  # reported, but nothing to alert on
         with self.shared.lock:
             self.shared.violations_total += 1
             self.shared.last_violation_at = time.time()
@@ -964,7 +1050,8 @@ class PatrolVision(threading.Thread):
 
     def _publish(self, frame, detections, observations, annotate, encode_jpeg) -> None:
         try:
-            drawn = annotate(frame, detections, observations)
+            steady = self.vision_state.display_for(observations)
+            drawn = annotate(frame, detections, observations, steady=steady)
             state = self.shared.snapshot()
             self._draw_hud(drawn, state)
             jpeg = encode_jpeg(drawn, self.cfg.camera.mjpeg_quality)

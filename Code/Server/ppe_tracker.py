@@ -51,20 +51,39 @@ except ImportError:  # pragma: no cover
     _HAVE_CV = False
 
 
+COMPLIANT = "compliant"
+NON_COMPLIANT = "non_compliant"
+
+
 @dataclass
 class ViolationEvent:
-    """A confirmed violation, ready to be snapshotted and uploaded."""
+    """A confirmed verdict on one person, ready to be snapshotted and uploaded.
+
+    Usually a violation (`status` NON_COMPLIANT, `items` = what's missing).
+    With temporal.compliant_n set, also a COMPLIANT report: `items` is empty
+    and `present` lists the PPE seen.
+    """
 
     track_id: int
     items: list[str]
     observation: PersonObservation
     frames_agree: dict[str, str]  # item -> "6/10"
     confirmed_at: float
+    status: str = NON_COMPLIANT
+    present: list[str] = field(default_factory=list)
+    # Required items still undecided when the report went out.
+    unsure: list[str] = field(default_factory=list)
+    # The camera frame `observation` came from, chosen to agree with the
+    # verdict. Not serialised.
+    frame: object | None = None
 
     def to_json(self) -> dict:
         return {
             "track_id": self.track_id,
+            "status": self.status,
             "missing_ppe": list(self.items),
+            "present_ppe": list(self.present),
+            "unsure_ppe": list(self.unsure),
             "frames_agree": dict(self.frames_agree),
             **self.observation.to_json(),
         }
@@ -84,6 +103,8 @@ class Track:
     first_seen: float = 0.0
     last_seen: float = 0.0
     history: dict[str, deque[ItemStatus]] = field(default_factory=dict)
+    # When each verdict in `history` was recorded, same order and length.
+    times: dict[str, deque[float]] = field(default_factory=dict)
     # Highest-confidence observation seen while this track was confirming, so
     # the evidence image is the clearest frame rather than whichever one
     # happened to tip the counter over.
@@ -95,16 +116,47 @@ class Track:
     # we then notice also has no gloves.
     item_cooldown: dict[str, float] = field(default_factory=dict)
     signature: object | None = None
+    # Compliant reports: once per person per cooldown, with their own
+    # clearest frame (best_* above only ever holds violation frames).
+    compliant_until: float = float("-inf")
+    best_ok_obs: PersonObservation | None = None
+    best_ok_frame: object | None = None
+    best_ok_score: float = -1.0
+    # Last decided per-item status for the live view -- OK / MISSING /
+    # CHECKING -- held until the evidence firmly says otherwise.
+    shown: dict[str, str] = field(default_factory=dict)
+    # The last window of judged frames, (observation, frame), so a report's
+    # photo can be one that actually agrees with the report.
+    recent: deque = field(default_factory=deque)
+    first_recorded: float | None = None
+    # When an item was first confirmed missing and a report became due; the
+    # decide_timeout_s wait runs from here.
+    pending_since: float | None = None
 
     def suppressed(self, item: str, now: float) -> bool:
         return now < self.item_cooldown.get(item, float("-inf"))
 
-    def record(self, item: str, status: ItemStatus, window: int) -> None:
+    def record(
+        self, item: str, status: ItemStatus, window: int, now: float = 0.0
+    ) -> None:
         buf = self.history.get(item)
         if buf is None or buf.maxlen != window:
             buf = deque(buf or (), maxlen=window)
             self.history[item] = buf
         buf.append(status)
+        tbuf = self.times.get(item)
+        if tbuf is None or tbuf.maxlen != window:
+            tbuf = deque(tbuf or (), maxlen=window)
+            self.times[item] = tbuf
+        tbuf.append(now)
+
+    def span(self, item: str, statuses: tuple[str, ...]) -> float:
+        """Seconds between the first and last window frame with one of `statuses`."""
+        stamps = [
+            t for st, t in zip(self.history.get(item, ()), self.times.get(item, ()))
+            if st in statuses
+        ]
+        return stamps[-1] - stamps[0] if len(stamps) > 1 else 0.0
 
     def counts(self, item: str) -> tuple[int, int, int, int]:
         """(positive, absent, present, total) over the window for `item`."""
@@ -116,6 +168,7 @@ class Track:
 
     def clear_item(self, item: str) -> None:
         self.history.pop(item, None)
+        self.times.pop(item, None)
 
 
 # --------------------------------------------------------------------------
@@ -217,9 +270,17 @@ class PersonTracker:
             matched_ids.add(track.track_id)
 
             if record:
+                if track.first_recorded is None:
+                    track.first_recorded = now
+                if track.recent.maxlen != self.window:
+                    track.recent = deque(track.recent, maxlen=self.window)
+                track.recent.append(
+                    (obs, frame_bgr.copy() if frame_bgr is not None and _HAVE_CV else frame_bgr)
+                )
                 for item, evidence in obs.items.items():
-                    track.record(item, evidence.status, self.window)
+                    track.record(item, evidence.status, self.window, now)
                 self._maybe_keep_best(track, obs, frame_bgr)
+                self._maybe_keep_best_ok(track, obs, frame_bgr)
             if track.signature is None and frame_bgr is not None:
                 track.signature = hist_signature(frame_bgr, track.box)
             out.append((track, obs))
@@ -297,6 +358,17 @@ class PersonTracker:
             if frame_bgr is not None:
                 track.best_frame = frame_bgr.copy() if _HAVE_CV else frame_bgr
 
+    def _maybe_keep_best_ok(self, track: Track, obs: PersonObservation, frame_bgr) -> None:
+        """Clearest frame where every item was seen, for a compliant report."""
+        if not obs.items or any(ev.status != "PRESENT" for ev in obs.items.values()):
+            return
+        score = obs.person.conf
+        if score > track.best_ok_score:
+            track.best_ok_score = score
+            track.best_ok_obs = obs
+            if frame_bgr is not None:
+                track.best_ok_frame = frame_bgr.copy() if _HAVE_CV else frame_bgr
+
     def reset(self) -> None:
         self.tracks.clear()
 
@@ -340,21 +412,58 @@ class ViolationConfirmer:
                 # the PPE clears the item outright.
                 continue
             if is_positive_evidence_item(item):
-                if positive >= self.temporal.positive_n:
-                    out[item] = f"{positive}/{total}"
+                agree, need = positive, self.temporal.positive_n
+                kinds: tuple[str, ...] = ("MISSING_POSITIVE",)
             else:
                 # Absence-only: weaker evidence, stricter bar, and positive
                 # frames count toward it too.
-                agree = positive + absent
-                if agree >= self.temporal.absence_n:
-                    out[item] = f"{agree}/{total}"
+                agree, need = positive + absent, self.temporal.absence_n
+                kinds = ("MISSING_POSITIVE", "MISSING_ABSENT")
+            if agree < need:
+                continue
+            if track.span(item, kinds) < self.temporal.min_duration_s:
+                continue  # agreed, but not for long enough yet
+            out[item] = f"{agree}/{total}"
         return out
 
+    def compliant_items(self, track: Track) -> dict[str, str] | None:
+        """Every item seen in compliant_n frames with no missing frame, else None."""
+        need = self.temporal.compliant_n
+        if need <= 0 or track.hits < self.temporal.min_track_hits or not track.history:
+            return None
+        out: dict[str, str] = {}
+        for item in track.history:
+            positive, absent, present, total = track.counts(item)
+            if positive or absent or present < need:
+                return None
+            out[item] = f"{present}/{total}"
+        return out
+
+    def display_status(self, track: Track) -> dict[str, str]:
+        """Steady per-item status for the live view: OK, MISSING or CHECKING.
+
+        Uses the same bars as the reports, and holds the last decision until
+        the evidence firmly says otherwise, so the overlay doesn't flicker
+        with every frame. A violation report clears that item's window; the
+        held MISSING keeps showing while it re-accumulates.
+        """
+        missing = self.confirmed_items(track)
+        ok_need = self.temporal.compliant_n or self.temporal.positive_n
+        for item in track.history:
+            positive, absent, present, _ = track.counts(item)
+            if item in missing:
+                track.shown[item] = "MISSING"
+            elif present >= ok_need and not (positive or absent):
+                track.shown[item] = "OK"
+            else:
+                track.shown.setdefault(item, "CHECKING")
+        return dict(track.shown)
+
     def feed(self, track: Track, now: float) -> ViolationEvent | None:
-        """Emit an event if this track has newly confirmed a violation."""
+        """Emit an event if this track has newly confirmed a verdict."""
         confirmed = self.confirmed_items(track)
         if not confirmed:
-            return None
+            return self._feed_compliant(track, now)
 
         fresh = {
             item: agree
@@ -363,21 +472,84 @@ class ViolationConfirmer:
         }
         if not fresh:
             return None
+        if track.pending_since is None:
+            track.pending_since = now
+
+        shown = self.display_status(track)
+        ok = sorted(i for i, st in shown.items() if st == "OK" and i not in fresh)
+        unsure = sorted(
+            i for i, st in shown.items() if st == "CHECKING" and i not in fresh
+        )
+        if unsure and self.temporal.decide_timeout_s > 0:
+            if now - track.pending_since < self.temporal.decide_timeout_s:
+                return None  # wait: one report per person, not one per item
         if not self._rate_ok(now):
             return None
 
-        obs = track.best_obs
+        items = sorted(fresh)
+        obs, frame = self.select_evidence(track, items, ok)
         if obs is None:
             return None
-
-        items = sorted(fresh)
         self._note_emit(track, items, now)
+        # No contradicting "compliant" report straight after a violation.
+        track.compliant_until = max(track.compliant_until, now + self.cooldown.per_person_s)
         return ViolationEvent(
             track_id=track.track_id,
             items=items,
             observation=obs,
             frames_agree=fresh,
             confirmed_at=now,
+            present=ok,
+            unsure=unsure,
+            frame=frame,
+        )
+
+    def select_evidence(
+        self, track: Track, missing: list[str], ok: list[str]
+    ) -> tuple[PersonObservation | None, object | None]:
+        """The recent frame that best shows the verdict being reported.
+
+        Scores each judged frame by how many items it agrees on (missing
+        ones missing, fine ones present), then by person confidence. Falls
+        back to the cached best frame for tracks with no stored window.
+        """
+        best, best_score = None, None
+        for obs, frame in track.recent:
+            agree = sum(1 for i in missing if obs.items.get(i) and obs.items[i].is_missing)
+            agree += sum(1 for i in ok if obs.items.get(i) and obs.items[i].status == "PRESENT")
+            score = (agree, obs.person.conf)
+            if best_score is None or score >= best_score:
+                best, best_score = (obs, frame), score
+        if best is not None:
+            return best
+        return track.best_obs, track.best_frame
+
+    def _feed_compliant(self, track: Track, now: float) -> ViolationEvent | None:
+        """A compliant report, at most once per person per cooldown.
+
+        Deliberately outside the global violation rate limit: a compliant
+        report must never delay the next violation.
+        """
+        ok = self.compliant_items(track)
+        if not ok or now < track.compliant_until:
+            return None
+        obs, frame = self.select_evidence(track, [], sorted(ok))
+        if obs is None:
+            obs, frame = track.best_ok_obs, track.best_ok_frame
+        if obs is None:
+            return None
+        track.compliant_until = now + self.cooldown.per_person_s
+        for item in ok:
+            track.shown[item] = "OK"
+        return ViolationEvent(
+            track_id=track.track_id,
+            items=[],
+            observation=obs,
+            frames_agree=ok,
+            confirmed_at=now,
+            status=COMPLIANT,
+            present=sorted(ok),
+            frame=frame,
         )
 
     # --------------------------------------------------------------- helpers
@@ -390,10 +562,18 @@ class ViolationConfirmer:
         return len(self._emit_times) < self.cooldown.max_per_hour
 
     def _note_emit(self, track: Track, items: list[str], now: float) -> None:
-        for item in items:
+        track.pending_since = None
+        # The whole person is reported, so every item they're judged on waits
+        # out the cooldown -- an item confirmed a few seconds later goes on
+        # their next report rather than spawning a second card now.
+        for item in set(track.history) | set(items):
             track.item_cooldown[item] = now + self.cooldown.per_person_s
+        for item in items:
             # Clear the window so re-accumulation starts clean after cooldown.
             track.clear_item(item)
+            # ...which also wipes the evidence display_status() reads, so
+            # pin the label here or the live view would never show MISSING.
+            track.shown[item] = "MISSING"
         self._last_emit = now
         self._emit_times.append(now)
         if track.signature is not None:
@@ -445,6 +625,8 @@ class PatrolVisionState:
         self.tracker = PersonTracker(window=temporal.window_m)
         self.confirmer = ViolationConfirmer(temporal, cooldown)
         self._known: set[int] = set()
+        # id(observation) -> track, for the frame just processed
+        self._last_pairs: dict[int, Track] = {}
 
     def process(
         self,
@@ -454,6 +636,7 @@ class PatrolVisionState:
         record: bool = True,
     ) -> list[ViolationEvent]:
         pairs = self.tracker.update(observations, now, frame_bgr, record=record)
+        self._last_pairs = {id(obs): track for track, obs in pairs}
         events: list[ViolationEvent] = []
         for track, _obs in pairs:
             if track.track_id not in self._known:
@@ -467,10 +650,21 @@ class PatrolVisionState:
         self._known &= set(self.tracker.tracks)
         return events
 
+    def display_for(
+        self, observations: list[PersonObservation]
+    ) -> list[dict[str, str] | None]:
+        """Steady per-item status for each observation of the last frame."""
+        out: list[dict[str, str] | None] = []
+        for obs in observations:
+            track = self._last_pairs.get(id(obs))
+            out.append(self.confirmer.display_status(track) if track else None)
+        return out
+
     def reset(self) -> None:
         self.tracker.reset()
         self.confirmer.reset()
         self._known.clear()
+        self._last_pairs.clear()
 
     def describe(self) -> str:
         bits: list[str] = []

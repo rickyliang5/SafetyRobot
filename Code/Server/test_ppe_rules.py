@@ -317,6 +317,77 @@ def test_empty_frame():
 
 
 # --------------------------------------------------------------------------
+# weak detections and hi-vis colour veto a "missing" verdict
+# --------------------------------------------------------------------------
+
+
+def test_weak_helmet_turns_missing_into_unknown():
+    """The model at 0.23 on a real hard hat is not proof of a bare head."""
+    obs = engine().evaluate_frame(
+        [det("person", NEAR_PERSON, 0.92), det("head", NEAR_HEAD, 0.88)],
+        FRAME,
+        hints=[det("helmet", NEAR_HELMET, 0.23)],
+    )
+    assert status(obs) == "UNKNOWN"
+
+
+def test_hint_on_another_person_does_not_count():
+    obs = engine().evaluate_frame(
+        [det("person", NEAR_PERSON, 0.92), det("head", NEAR_HEAD, 0.88)],
+        FRAME,
+        hints=[det("helmet", (20.0, 20.0, 60.0, 60.0), 0.30)],
+    )
+    assert status(obs) == "MISSING_POSITIVE"
+
+
+def test_hint_never_makes_someone_compliant():
+    obs = engine().evaluate_frame(
+        [det("person", NEAR_PERSON, 0.92)], FRAME,
+        hints=[det("helmet", NEAR_HELMET, 0.30)],
+    )
+    assert status(obs) != "PRESENT"
+
+
+def _frame(torso_bgr):
+    import numpy as np
+
+    frame = np.full((480, 640, 3), 90, dtype=np.uint8)
+    x1, y1, x2, y2 = map(int, NEAR_PERSON)
+    h = y2 - y1
+    frame[y1 + int(0.25 * h): y1 + int(0.6 * h), x1:x2] = torso_bgr
+    return frame
+
+
+def test_hivis_torso_vetoes_no_vest():
+    dets = [det("person", NEAR_PERSON, 0.92)]
+    eng = engine(["safety-vest"])
+    plain = eng.evaluate_frame(dets, FRAME, frame_bgr=_frame((70, 70, 70)))
+    assert status(plain, "safety-vest") == "MISSING_ABSENT"
+    vest = eng.evaluate_frame(dets, FRAME, frame_bgr=_frame((40, 255, 210)))  # BGR hi-vis
+    assert status(vest, "safety-vest") == "UNKNOWN"
+
+
+def test_yellow_hat_colour_vetoes_no_hard_hat():
+    import numpy as np
+
+    dets = [det("person", NEAR_PERSON, 0.92), det("head", NEAR_HEAD, 0.88)]
+    frame = np.full((480, 640, 3), 90, dtype=np.uint8)
+    out = engine().evaluate_frame(dets, FRAME, frame_bgr=frame)
+    assert status(out) == "MISSING_POSITIVE"
+    x1, y1, x2, y2 = map(int, NEAR_HEAD)
+    frame[y1 - 8: y1 + 25, x1:x2] = (0, 220, 255)  # BGR hard-hat yellow
+    out = engine().evaluate_frame(dets, FRAME, frame_bgr=frame)
+    assert status(out) == "UNKNOWN"
+
+
+def test_hivis_veto_can_be_disabled():
+    dets = [det("person", NEAR_PERSON, 0.92)]
+    eng = engine(["safety-vest"], hivis_veto_frac=0.0)
+    out = eng.evaluate_frame(dets, FRAME, frame_bgr=_frame((40, 255, 210)))
+    assert status(out, "safety-vest") == "MISSING_ABSENT"
+
+
+# --------------------------------------------------------------------------
 # runner
 # --------------------------------------------------------------------------
 

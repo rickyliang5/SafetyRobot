@@ -83,6 +83,52 @@ def test_camera_points_forward_and_is_steady_while_wandering():
     assert shared.camera_steady is True
 
 
+class DeadSonarCar(SimulatedCar):
+    """A car whose ultrasonic has stopped answering (loose cable)."""
+
+    def sonar_ok(self) -> bool:
+        return False
+
+    def get_distance(self):
+        return None
+
+
+def build_dead_sonar(**patrol_overrides):
+    drive, _, shared, cfg = build(**patrol_overrides)
+    car = DeadSonarCar()
+    drive.car = car
+    return drive, car, shared, cfg
+
+
+def test_dead_sonar_never_drives():
+    drive, car, shared, cfg = build_dead_sonar()
+    for _ in range(10):
+        tick(drive)
+        assert car.motor == (0, 0, 0, 0), "drove with a dead ultrasonic"
+    assert drive.state == WANDER
+
+
+def test_dead_sonar_still_looks_up_for_people():
+    drive, car, shared, cfg = build_dead_sonar()
+    drive._last_look_up -= cfg.patrol.look_up_interval_s + 1
+    tick(drive)
+    assert drive.state == HOLD, "inspection must continue with a dead sonar"
+
+
+def test_sonar_dying_mid_scan_stops_the_manoeuvre():
+    drive, car, shared, cfg = build(distances=[20.0])
+    tick(drive)
+    assert drive.state == BLOCKED_SCAN
+    drive.car = DeadSonarCar()
+    tick(drive)
+    assert drive.state == WANDER and drive.car.motor == (0, 0, 0, 0)
+
+
+def test_no_motor_car_reports_inner_sonar_health():
+    assert NoMotorCar(DeadSonarCar()).sonar_ok() is False
+    assert NoMotorCar(SimulatedCar()).sonar_ok() is True
+
+
 def test_obstacle_triggers_a_scan():
     drive, car, shared, cfg = build(distances=[20.0])
     tick(drive)

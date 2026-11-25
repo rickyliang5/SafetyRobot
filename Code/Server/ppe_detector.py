@@ -347,6 +347,36 @@ class PpeDetector:
             allowed=allowed,
         )
 
+    def detect_with_hints(
+        self, frame_bgr: np.ndarray, hint_conf: float
+    ) -> tuple[list[Detection], list[Detection]]:
+        """Detections as detect() returns them, plus weak PPE detections.
+
+        One inference pass. `hints` are PPE detections at or above
+        `hint_conf` but below the confidence that would make them count,
+        which the rules use only to avoid calling an item missing.
+        """
+        if frame_bgr is None or frame_bgr.size == 0:
+            return [], []
+        from ppe_classes import PPE_ITEMS
+
+        ppe_classes = {c for present, _ in PPE_ITEMS.values() for c in present}
+        h, w = frame_bgr.shape[:2]
+        blob, ratio, pad = preprocess(frame_bgr, self.input_size)
+        raw = self.session.run(self.output_names, {self.input_name: blob})[0]
+        everything = decode_v8(
+            raw, ratio, pad, (w, h),
+            conf_floor=min(self.conf, hint_conf), iou_thr=self.iou,
+        )
+        kept: list[Detection] = []
+        hints: list[Detection] = []
+        for d in everything:
+            if d.conf >= max(self.conf, self.class_conf.get(d.name, self.conf)):
+                kept.append(d)
+            elif d.name in ppe_classes and d.conf >= hint_conf:
+                hints.append(d)
+        return kept, hints
+
     def detect_crop(
         self,
         frame_bgr: np.ndarray,
@@ -451,8 +481,14 @@ def annotate(
     dets: list[Detection],
     observations: list | None = None,
     show_labels: bool = True,
+    steady: list | None = None,
 ) -> np.ndarray:
     """Draw each person's enforced PPE items and per-item verdicts. Returns a copy.
+
+    `steady`, aligned with `observations`, gives each person's time-smoothed
+    status per item (OK / MISSING / CHECKING, from the tracker). When given,
+    the text labels show that instead of this frame's verdict, so they don't
+    flicker; the boxes still show what this frame actually detected.
 
     Only boxes that matter are drawn: the PPE that satisfies an item (green),
     and the uncovered body part that proves it missing (red). Hands, shoes,
@@ -470,23 +506,31 @@ def annotate(
                 _box(out, d, _GREEN, f"{d.name} {d.conf:.2f}" if show_labels else None)
         return out
 
-    for obs in observations:
+    for idx, obs in enumerate(observations):
+        held = steady[idx] if steady and idx < len(steady) else None
         lines = []
         for item, ev in obs.items.items():
             present, bare = PPE_ITEMS[item]
             name = _ITEM_LABELS.get(item, item.upper())
+            if held is not None:
+                lines.append({
+                    "OK": (f"{name} OK", _GREEN),
+                    "MISSING": (f"NO {name}", _RED),
+                }.get(held.get(item, "CHECKING"), (f"{name} ...", _GREY)))
             if ev.status == "PRESENT":
-                lines.append((f"{name} OK", _GREEN))
+                if held is None:
+                    lines.append((f"{name} OK", _GREEN))
                 for cls in present:
                     for d in obs.attached.get(cls, []):
                         _box(out, d, _GREEN, f"{name.lower()} {d.conf:.2f}" if show_labels else None)
             elif ev.is_missing:
-                lines.append((f"NO {name}", _RED))
+                if held is None:
+                    lines.append((f"NO {name}", _RED))
                 # The uncovered head/face is the evidence; vest has none to show.
                 for cls in bare:
                     for d in obs.attached.get(cls, []):
                         _box(out, d, _RED, None)  # the verdict stack names it
-            else:
+            elif held is None:
                 # UNKNOWN must never read as OK: the live view is how people
                 # judge the detector.
                 lines.append((f"{name} ?", _GREY))
